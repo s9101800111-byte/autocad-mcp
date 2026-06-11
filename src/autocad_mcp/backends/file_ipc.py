@@ -25,6 +25,30 @@ from autocad_mcp.config import IPC_DIR, IPC_TIMEOUT, LISP_DIR
 
 log = structlog.get_logger()
 
+
+def _redecode_cjk(obj, encoding: str = "big5"):
+    """Recursively fix strings mis-encoded as Latin-1 code-points.
+
+    AutoCAD LISP serialises Chinese characters (Big5 bytes) as individual
+    \\u00xx JSON escapes. After json.loads() each byte becomes a U+00xx
+    code-point. We detect such strings (any char in U+0080-U+00FF) and
+    re-encode to raw bytes via latin-1, then decode with the target encoding.
+    Pure ASCII strings pass through unchanged.
+    """
+    if isinstance(obj, str):
+        if any(0x80 <= ord(c) <= 0xFF for c in obj):
+            try:
+                return obj.encode("latin-1").decode(encoding)
+            except (UnicodeEncodeError, UnicodeDecodeError):
+                return obj
+        return obj
+    if isinstance(obj, dict):
+        return {k: _redecode_cjk(v, encoding) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_redecode_cjk(i, encoding) for i in obj]
+    return obj
+
+
 # IPC settings
 POLL_INTERVAL = 0.1  # seconds
 TIMEOUT = IPC_TIMEOUT  # seconds (configurable via AUTOCAD_MCP_IPC_TIMEOUT)
@@ -154,7 +178,15 @@ class FileIPCBackend(AutoCADBackend):
                 "params": clean_params,
                 "ts": time.time(),
             }
-            tmp_file.write_text(json.dumps(payload), encoding="utf-8")
+            # Write with system ANSI codepage (mbcs on Windows = cp950 in zh-TW)
+            # so AutoCAD LISP can read CJK strings directly. ensure_ascii=False
+            # keeps CJK as raw chars instead of \uXXXX escapes which LISP can't decode.
+            req_encoding = "mbcs" if sys.platform == "win32" else "utf-8"
+            tmp_file.write_text(
+                json.dumps(payload, ensure_ascii=False),
+                encoding=req_encoding,
+                errors="replace",
+            )
             tmp_file.rename(cmd_file)
 
             # Type the fixed dispatch trigger
@@ -172,6 +204,7 @@ class FileIPCBackend(AutoCADBackend):
                         except UnicodeDecodeError:
                             text = result_file.read_text(encoding="cp1252")
                         data = json.loads(text)
+                        data = _redecode_cjk(data)
                         # Verify request_id matches
                         if data.get("request_id") == request_id:
                             return CommandResult(
@@ -285,6 +318,24 @@ class FileIPCBackend(AutoCADBackend):
 
     async def drawing_open(self, path: str) -> CommandResult:
         return await self._dispatch("drawing-open", {"path": path})
+
+    async def drawing_wblock_by_regions(
+        self,
+        boundary_layer: str,
+        output_dir: str,
+        name_template: str = "region_{index}",
+        index_start: int = 1,
+        index_pad: int = 2,
+        text_layer: str | None = None,
+    ) -> CommandResult:
+        return await self._dispatch("drawing-wblock-by-regions", {
+            "boundary_layer": boundary_layer,
+            "output_dir": output_dir.replace("\\", "/"),
+            "name_template": name_template,
+            "index_start": index_start,
+            "index_pad": index_pad,
+            "text_layer": text_layer,
+        })
 
     # --- Undo / Redo ---
 

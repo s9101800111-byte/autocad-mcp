@@ -50,6 +50,11 @@ async def drawing(
       get_variables — Get system variables. data: {names: [...]}
       undo       — Undo last operation.
       redo       — Redo last undone operation.
+      wblock_by_regions — Batch WBLOCK by closed polylines on a layer.
+        data: {boundary_layer, output_dir, name_template?, index_start?,
+               index_pad?, text_layer?}
+        name_template placeholders: {index} {text} {handle} {layer}
+        Base point = (0,0,0). Boundary polyline is included in output.
     """
     data = data or {}
     backend = await get_backend()
@@ -74,6 +79,15 @@ async def drawing(
         result = await backend.undo()
     elif operation == "redo":
         result = await backend.redo()
+    elif operation == "wblock_by_regions":
+        result = await backend.drawing_wblock_by_regions(
+            data["boundary_layer"],
+            data["output_dir"],
+            data.get("name_template", "region_{index}"),
+            int(data.get("index_start", 1)),
+            int(data.get("index_pad", 2)),
+            data.get("text_layer"),
+        )
     else:
         return _json({"error": f"Unknown drawing operation: {operation}"})
 

@@ -412,6 +412,9 @@
     ((= cmd-name "drawing-plot-pdf")
      (mcp-cmd-drawing-plot-pdf params-json))
 
+    ((= cmd-name "drawing-wblock-by-regions")
+     (mcp-cmd-drawing-wblock-by-regions params-json))
+
     ;; --- P&ID list symbols ---
     ((= cmd-name "pid-list-symbols")
      (mcp-cmd-pid-list-symbols params-json))
@@ -1366,6 +1369,150 @@
     )
   )
 )
+
+;; -----------------------------------------------------------------------
+;; WBLOCK by regions — batch export by closed polylines on a layer
+;; -----------------------------------------------------------------------
+
+(defun mcp-poly-vertices (ent / edata pts pair)
+  "Return 2D vertex list of an LWPOLYLINE entity as ((x y) ...)."
+  (setq edata (entget ent) pts nil)
+  (foreach pair edata
+    (if (= (car pair) 10)
+      (setq pts (cons (list (cadr pair) (caddr pair)) pts))))
+  (reverse pts))
+
+(defun mcp-str-replace (s old-str new-str / result pos len-old)
+  "Replace all occurrences of old-str with new-str in s."
+  (cond
+    ((null s) "")
+    ((or (null old-str) (= old-str "")) s)
+    (t
+     (progn
+       (if (null new-str) (setq new-str ""))
+       (setq result "" len-old (strlen old-str))
+       (while (setq pos (vl-string-search old-str s))
+         (setq result (strcat result (substr s 1 pos) new-str))
+         (setq s (substr s (+ pos len-old 1))))
+       (strcat result s)))))
+
+(defun mcp-pad-int (n width / s)
+  "Zero-pad integer n to width characters."
+  (setq s (itoa n))
+  (while (< (strlen s) width)
+    (setq s (strcat "0" s)))
+  s)
+
+(defun mcp-sanitize-filename (s / result i ch)
+  "Replace Windows-illegal filename characters with underscore."
+  (if (null s) (setq s ""))
+  (setq result "" i 1)
+  (while (<= i (strlen s))
+    (setq ch (substr s i 1))
+    (if (member ch '("<" ">" ":" "\"" "/" "\\" "|" "?" "*"))
+      (setq result (strcat result "_"))
+      (setq result (strcat result ch)))
+    (setq i (1+ i)))
+  result)
+
+(defun mcp-find-text-in-region (vertices text-layer / filter ss ent edata text-val result)
+  "Return text content of first TEXT/MTEXT fully inside the polygon vertices."
+  (setq filter (list '(0 . "TEXT,MTEXT")))
+  (if (and text-layer (> (strlen text-layer) 0))
+    (setq filter (append filter (list (cons 8 text-layer)))))
+  (setq ss (ssget "_WP" vertices filter))
+  (setq result "")
+  (if ss
+    (progn
+      (setq ent (ssname ss 0))
+      (setq edata (entget ent))
+      (setq text-val (cdr (assoc 1 edata)))
+      (if text-val (setq result text-val))))
+  result)
+
+(defun mcp-cmd-drawing-wblock-by-regions (params /
+       boundary-layer output-dir name-template index-start-num index-pad-num text-layer
+       index-start-i index-pad-i
+       ss-boundary i n ent edata vertices ss-region filter
+       region-text region-name region-name-clean out-path
+       exported skipped result)
+  (setq boundary-layer  (mcp-json-get-string params "boundary_layer"))
+  (setq output-dir      (mcp-json-get-string params "output_dir"))
+  (setq name-template   (mcp-json-get-string params "name_template"))
+  (setq index-start-num (mcp-json-get-number params "index_start"))
+  (setq index-pad-num   (mcp-json-get-number params "index_pad"))
+  (setq text-layer      (mcp-json-get-string params "text_layer"))
+  (cond
+    ((or (null boundary-layer) (= boundary-layer ""))
+     (cons nil "boundary_layer required"))
+    ((or (null output-dir) (= output-dir ""))
+     (cons nil "output_dir required"))
+    (t
+     (progn
+       (if (or (null name-template) (= name-template ""))
+         (setq name-template "region_{index}"))
+       (if (null index-start-num) (setq index-start-num 1.0))
+       (if (null index-pad-num)   (setq index-pad-num 2.0))
+       (setq index-start-i (fix index-start-num))
+       (setq index-pad-i   (fix index-pad-num))
+       (if (< index-pad-i 1) (setq index-pad-i 1))
+       (if (not (or (= (substr output-dir (strlen output-dir)) "/")
+                    (= (substr output-dir (strlen output-dir)) "\\")))
+         (setq output-dir (strcat output-dir "/")))
+       (setq filter (list '(0 . "LWPOLYLINE")
+                          (cons 8 boundary-layer)
+                          '(-4 . "&=") '(70 . 1)))
+       (setq ss-boundary (ssget "_X" filter))
+       (if (null ss-boundary)
+         (cons nil (strcat "No closed LWPOLYLINE on layer: " boundary-layer))
+         (progn
+           (setq n (sslength ss-boundary))
+           (setq exported "" skipped "" i 0)
+           (while (< i n)
+             (setq ent (ssname ss-boundary i))
+             (setq edata (entget ent))
+             (setq vertices (mcp-poly-vertices ent))
+             (if (< (length vertices) 3)
+               (progn
+                 (if (> (strlen skipped) 0) (setq skipped (strcat skipped ",")))
+                 (setq skipped (strcat skipped
+                   "\"index " (itoa (+ index-start-i i)) ": vertices<3\"")))
+               (progn
+                 (setq ss-region (ssget "_CP" vertices))
+                 (if (null ss-region)
+                   (progn
+                     (if (> (strlen skipped) 0) (setq skipped (strcat skipped ",")))
+                     (setq skipped (strcat skipped
+                       "\"index " (itoa (+ index-start-i i)) ": empty\"")))
+                   (progn
+                     (setq region-text "")
+                     (if (vl-string-search "{text}" name-template)
+                       (setq region-text (mcp-find-text-in-region vertices text-layer)))
+                     (setq region-name name-template)
+                     (setq region-name (mcp-str-replace region-name "{index}"
+                       (mcp-pad-int (+ index-start-i i) index-pad-i)))
+                     (setq region-name (mcp-str-replace region-name "{text}" region-text))
+                     (setq region-name (mcp-str-replace region-name "{handle}"
+                       (cdr (assoc 5 edata))))
+                     (setq region-name (mcp-str-replace region-name "{layer}"
+                       (cdr (assoc 8 edata))))
+                     (setq region-name-clean (mcp-sanitize-filename region-name))
+                     (setq out-path (strcat output-dir region-name-clean ".dwg"))
+                     (if (findfile out-path) (vl-file-delete out-path))
+                     (setvar "FILEDIA" 0)
+                     (command "_.-WBLOCK" out-path "" '(0.0 0.0 0.0) ss-region "")
+                     (setvar "FILEDIA" 1)
+                     ;; -WBLOCK erases source objects by default; OOPS restores
+                     ;; the last erased batch. Must be called after each iteration.
+                     (command "_.OOPS")
+                     (if (> (strlen exported) 0) (setq exported (strcat exported ",")))
+                     (setq exported (strcat exported
+                       "\"" (mcp-escape-string out-path) "\""))))))
+             (setq i (1+ i)))
+           (setq result (strcat "{\"count\":" (itoa n)
+                                ",\"exported\":[" exported "]"
+                                ",\"skipped\":[" skipped "]}"))
+           (cons T result)))))))
 
 ;; -----------------------------------------------------------------------
 ;; Startup message

@@ -66,7 +66,7 @@ async def get_backend() -> AutoCADBackend:
 
 def _json(data: Any) -> str:
     """Serialize to compact JSON string."""
-    return json.dumps(data, default=str, separators=(",", ":"))
+    return json.dumps(data, default=str, separators=(",", ":"), ensure_ascii=False)
 
 
 # ---------------------------------------------------------------------------

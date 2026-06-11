@@ -87,6 +87,17 @@ class AutoCADBackend(ABC):
     async def drawing_open(self, path: str) -> CommandResult:
         return CommandResult(ok=False, error="Not supported on this backend")
 
+    async def drawing_wblock_by_regions(
+        self,
+        boundary_layer: str,
+        output_dir: str,
+        name_template: str = "region_{index}",
+        index_start: int = 1,
+        index_pad: int = 2,
+        text_layer: str | None = None,
+    ) -> CommandResult:
+        return CommandResult(ok=False, error="Not supported on this backend")
+
     # --- Undo / Redo ---
 
     async def undo(self) -> CommandResult:
