@@ -216,6 +216,76 @@ class EzdxfBackend(AutoCADBackend):
         except Exception as ex:
             return CommandResult(ok=False, error=str(ex))
 
+    async def entity_get_selection(self) -> CommandResult:
+        return CommandResult(
+            ok=False,
+            error="get_selection needs interactive AutoCAD (file_ipc backend); "
+            "no implied selection set exists in ezdxf headless mode",
+        )
+
+    async def entity_query(self, layer=None, etype=None, text=None, window=None, mode="crossing") -> CommandResult:
+        from fnmatch import fnmatch
+
+        layer_pats = [p.strip().upper() for p in layer.split(",")] if layer else None
+        type_pats = [p.strip().upper() for p in etype.split(",")] if etype else None
+        text_pat = text.upper() if text else None
+        if window:
+            x1, y1, x2, y2 = window
+            wxmin, wxmax = min(x1, x2), max(x1, x2)
+            wymin, wymax = min(y1, y2), max(y1, y2)
+            from ezdxf import bbox
+
+        entities = []
+        for e in self._msp:
+            elayer = e.dxf.get("layer", "0")
+            if layer_pats and not any(fnmatch(elayer.upper(), p) for p in layer_pats):
+                continue
+            etp = e.dxftype()
+            if type_pats and not any(fnmatch(etp, p) for p in type_pats):
+                continue
+
+            if etp == "MTEXT":
+                etext = getattr(e, "text", None)
+            elif etp in ("TEXT", "ATTRIB", "ATTDEF"):
+                etext = e.dxf.get("text", None)
+            else:
+                etext = None
+            if text_pat is not None and (etext is None or not fnmatch(etext.upper(), text_pat)):
+                continue
+
+            if window:
+                ebox = bbox.extents([e])
+                if not ebox.has_data:
+                    continue
+                emin_x, emin_y = ebox.extmin.x, ebox.extmin.y
+                emax_x, emax_y = ebox.extmax.x, ebox.extmax.y
+                if mode == "inside":
+                    if not (emin_x >= wxmin and emax_x <= wxmax and emin_y >= wymin and emax_y <= wymax):
+                        continue
+                else:  # crossing — any overlap
+                    if emax_x < wxmin or emin_x > wxmax or emax_y < wymin or emin_y > wymax:
+                        continue
+
+            pt = None
+            try:
+                if etp in ("CIRCLE", "ARC"):
+                    pt = list(e.dxf.center)[:2]
+                elif etp == "LINE":
+                    pt = list(e.dxf.start)[:2]
+                elif etp in ("TEXT", "MTEXT", "INSERT", "ATTRIB", "ATTDEF"):
+                    pt = list(e.dxf.insert)[:2]
+            except Exception:
+                pt = None
+
+            item = {"type": etp, "handle": e.dxf.handle, "layer": elayer}
+            if pt is not None:
+                item["point"] = [round(pt[0], 6), round(pt[1], 6)]
+            if etext:
+                item["text"] = etext
+            entities.append(item)
+
+        return CommandResult(ok=True, payload={"count": len(entities), "entities": entities})
+
     async def entity_erase(self, entity_id) -> CommandResult:
         try:
             e = self._doc.entitydb.get(entity_id)

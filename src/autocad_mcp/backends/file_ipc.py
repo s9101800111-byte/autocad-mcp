@@ -156,12 +156,17 @@ class FileIPCBackend(AutoCADBackend):
 
     # --- IPC dispatch ---
 
-    async def _dispatch(self, command: str, params: dict) -> CommandResult:
-        """Send a command via file IPC and wait for result."""
-        async with self._lock:
-            return await self._dispatch_unlocked(command, params)
+    async def _dispatch(self, command: str, params: dict, send_esc: bool = True) -> CommandResult:
+        """Send a command via file IPC and wait for result.
 
-    async def _dispatch_unlocked(self, command: str, params: dict) -> CommandResult:
+        send_esc=False skips the 2x ESC prefix. Needed for reads of the
+        implied/grip selection (get_selection): the ESC would clear the very
+        pickfirst set the command is meant to read.
+        """
+        async with self._lock:
+            return await self._dispatch_unlocked(command, params, send_esc)
+
+    async def _dispatch_unlocked(self, command: str, params: dict, send_esc: bool = True) -> CommandResult:
         """Core IPC logic (must be called under _lock)."""
         request_id = uuid.uuid4().hex[:12]
         cmd_file = self._ipc_dir / f"autocad_mcp_cmd_{request_id}.json"
@@ -190,7 +195,7 @@ class FileIPCBackend(AutoCADBackend):
             tmp_file.rename(cmd_file)
 
             # Type the fixed dispatch trigger
-            self._type_dispatch_trigger()
+            self._type_dispatch_trigger(send_esc)
 
             # Poll for result
             deadline = time.time() + TIMEOUT
@@ -246,11 +251,13 @@ class FileIPCBackend(AutoCADBackend):
         except Exception:
             return None
 
-    def _type_dispatch_trigger(self):
+    def _type_dispatch_trigger(self, send_esc: bool = True):
         """Post '(c:mcp-dispatch)' + Enter via WM_CHAR to MDIClient — no focus steal.
 
         Sends ESC keystrokes first to cancel any stale pending command
         (e.g. from a previous timeout leaving AutoCAD in a command prompt).
+        send_esc=False skips this — required when reading the grip/pickfirst
+        selection, which ESC would clear.
         """
         try:
             import ctypes
@@ -263,10 +270,11 @@ class FileIPCBackend(AutoCADBackend):
             post = ctypes.windll.user32.PostMessageW
 
             # Cancel any pending command (2x ESC for nested commands)
-            for _ in range(2):
-                post(target, WM_KEYDOWN, VK_ESCAPE, 0)
-                post(target, WM_KEYUP, VK_ESCAPE, 0)
-            time.sleep(0.05)
+            if send_esc:
+                for _ in range(2):
+                    post(target, WM_KEYDOWN, VK_ESCAPE, 0)
+                    post(target, WM_KEYUP, VK_ESCAPE, 0)
+                time.sleep(0.05)
 
             for ch in "(c:mcp-dispatch)":
                 post(target, WM_CHAR, ord(ch), 0)
@@ -396,6 +404,18 @@ class FileIPCBackend(AutoCADBackend):
 
     async def entity_get(self, entity_id) -> CommandResult:
         return await self._dispatch("entity-get", {"entity_id": entity_id})
+
+    async def entity_get_selection(self) -> CommandResult:
+        # No ESC prefix — it would clear the grip selection we want to read.
+        return await self._dispatch("entity-get-selection", {}, send_esc=False)
+
+    async def entity_query(self, layer=None, etype=None, text=None, window=None, mode="crossing") -> CommandResult:
+        # window passed as "x1,y1,x2,y2" string (LISP JSON parser reads scalars only)
+        window_str = ",".join(str(v) for v in window) if window else None
+        return await self._dispatch("entity-query", {
+            "layer": layer, "etype": etype, "text": text,
+            "window_str": window_str, "mode": mode,
+        })
 
     async def entity_erase(self, entity_id) -> CommandResult:
         return await self._dispatch("entity-erase", {"entity_id": entity_id})

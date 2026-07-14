@@ -129,6 +129,16 @@ async def entity(
       list              — layer? → list entities
       count             — layer? → count entities
       get               — entity_id → entity details
+      get_selection     — Read the user's current pick/grip selection in AutoCAD.
+                          → {count, entities: [{type, handle, layer, point?, text?}]}
+                          (File IPC only — needs interactive AutoCAD.)
+      query             — Filter entities without round-tripping each handle.
+                          data: {layer?, etype?, text?, window?: [x1,y1,x2,y2], mode?}
+                            layer  — name/wildcard/comma-OR, e.g. "S-*,A-WALL"
+                            etype  — DXF type/comma-OR, e.g. "LINE,LWPOLYLINE"
+                            text   — group-1 wildcard for TEXT/MTEXT/ATTRIB, e.g. "*3F*"
+                            window — spatial box; mode "crossing" (default) or "inside"
+                          → {count, entities: [{type, handle, layer, point?, text?}]}
 
     Modify operations:
       copy    — entity_id, data: {dx, dy}
@@ -169,6 +179,13 @@ async def entity(
         result = await backend.entity_count(layer)
     elif operation == "get":
         result = await backend.entity_get(entity_id)
+    elif operation == "get_selection":
+        result = await backend.entity_get_selection()
+    elif operation == "query":
+        result = await backend.entity_query(
+            data.get("layer"), data.get("etype"), data.get("text"),
+            data.get("window"), data.get("mode", "crossing"),
+        )
     # --- Modify ---
     elif operation == "copy":
         result = await backend.entity_copy(entity_id, data["dx"], data["dy"])

@@ -252,6 +252,12 @@
     ((= cmd-name "entity-get")
      (mcp-cmd-entity-get params-json))
 
+    ((= cmd-name "entity-get-selection")
+     (mcp-cmd-entity-get-selection params-json))
+
+    ((= cmd-name "entity-query")
+     (mcp-cmd-entity-query params-json))
+
     ((= cmd-name "entity-erase")
      (mcp-cmd-entity-erase params-json))
 
@@ -872,6 +878,88 @@
       (setq result (strcat result "}"))
       (cons T result)
     )
+  )
+)
+
+;; --- Entity query: get_selection + query (shared summary helpers) ---
+
+(defun mcp-ent->summary (ent / ed etype handle elayer p txt s)
+  "Build a compact JSON object for one entity: type, handle, layer, point?, text?."
+  (setq ed (entget ent))
+  (setq etype (cdr (assoc 0 ed)))
+  (setq handle (cdr (assoc 5 ed)))
+  (setq elayer (cdr (assoc 8 ed)))
+  (setq s (strcat "{\"type\":\"" etype
+                  "\",\"handle\":\"" handle
+                  "\",\"layer\":\"" (mcp-escape-string elayer) "\""))
+  ;; reference point (DXF group 10 — center / start / insertion / first vertex)
+  (setq p (cdr (assoc 10 ed)))
+  (if p
+    (setq s (strcat s ",\"point\":[" (rtos (car p) 2 6) "," (rtos (cadr p) 2 6) "]"))
+  )
+  ;; text content (DXF group 1) for text-bearing entities
+  (setq txt (cdr (assoc 1 ed)))
+  (if (and txt (member etype '("TEXT" "MTEXT" "ATTRIB" "ATTDEF")))
+    (setq s (strcat s ",\"text\":\"" (mcp-escape-string txt) "\""))
+  )
+  (strcat s "}")
+)
+
+(defun mcp-ss->entities-json (ss / i n ent result)
+  "Serialize a selection set to a comma-joined JSON array body."
+  (setq result "" i 0 n (if ss (sslength ss) 0))
+  (while (< i n)
+    (setq ent (ssname ss i))
+    (if (> (strlen result) 0) (setq result (strcat result ",")))
+    (setq result (strcat result (mcp-ent->summary ent)))
+    (setq i (1+ i))
+  )
+  result
+)
+
+(defun mcp-build-filter (layer etype text / flt)
+  "Build an ssget filter assoc-list from optional params (nil = match all)."
+  (setq flt '())
+  (if (and etype (> (strlen etype) 0)) (setq flt (cons (cons 0 etype) flt)))
+  (if (and layer (> (strlen layer) 0)) (setq flt (cons (cons 8 layer) flt)))
+  (if (and text  (> (strlen text)  0)) (setq flt (cons (cons 1 text)  flt)))
+  flt
+)
+
+(defun mcp-cmd-entity-get-selection (params / ss)
+  "Return the current implied (pickfirst/grip) selection set."
+  (setq ss (ssget "_I"))
+  (if (null ss)
+    (cons T "{\"count\":0,\"entities\":[]}")
+    (cons T (strcat "{\"count\":" (itoa (sslength ss))
+                    ",\"entities\":[" (mcp-ss->entities-json ss) "]}"))
+  )
+)
+
+(defun mcp-cmd-entity-query (params / layer etype text window-str mode flt pts p1 p2 ss)
+  "Filter entities by layer/type/text and optional spatial window."
+  (setq layer (mcp-json-get-string params "layer"))
+  (setq etype (mcp-json-get-string params "etype"))
+  (setq text (mcp-json-get-string params "text"))
+  (setq window-str (mcp-json-get-string params "window_str"))
+  (setq mode (mcp-json-get-string params "mode"))
+  (setq flt (mcp-build-filter layer etype text))
+  (if (and window-str (> (strlen window-str) 0))
+    (progn
+      (setq pts (mcp-split-string window-str ","))
+      (setq p1 (list (atof (nth 0 pts)) (atof (nth 1 pts))))
+      (setq p2 (list (atof (nth 2 pts)) (atof (nth 3 pts))))
+      (if (and mode (= (strcase mode) "INSIDE"))
+        (setq ss (if flt (ssget "_W" p1 p2 flt) (ssget "_W" p1 p2)))
+        (setq ss (if flt (ssget "_C" p1 p2 flt) (ssget "_C" p1 p2)))
+      )
+    )
+    (setq ss (if flt (ssget "_X" flt) (ssget "_X")))
+  )
+  (if (null ss)
+    (cons T "{\"count\":0,\"entities\":[]}")
+    (cons T (strcat "{\"count\":" (itoa (sslength ss))
+                    ",\"entities\":[" (mcp-ss->entities-json ss) "]}"))
   )
 )
 
