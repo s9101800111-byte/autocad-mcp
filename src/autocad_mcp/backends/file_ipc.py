@@ -417,6 +417,17 @@ class FileIPCBackend(AutoCADBackend):
             "window_str": window_str, "mode": mode, "limit": limit,
         })
 
+    async def entity_find_text(self, pattern, layer=None, window=None, mode="crossing",
+                               limit=None, ignore_case=True, include_attribs=True) -> CommandResult:
+        window_str = ",".join(str(v) for v in window) if window else None
+        return await self._dispatch("entity-find-text", {
+            "pattern": pattern, "layer": layer,
+            "window_str": window_str, "mode": mode, "limit": limit,
+            # The LISP-side JSON parser reads numbers, not booleans.
+            "ignore_case": 1 if ignore_case else 0,
+            "include_attribs": 1 if include_attribs else 0,
+        })
+
     async def entity_erase(self, entity_id) -> CommandResult:
         return await self._dispatch("entity-erase", {"entity_id": entity_id})
 

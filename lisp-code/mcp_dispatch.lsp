@@ -258,6 +258,9 @@
     ((= cmd-name "entity-query")
      (mcp-cmd-entity-query params-json))
 
+    ((= cmd-name "entity-find-text")
+     (mcp-cmd-entity-find-text params-json))
+
     ((= cmd-name "entity-erase")
      (mcp-cmd-entity-erase params-json))
 
@@ -972,6 +975,177 @@
     (setq ss (if flt (ssget "_X" flt) (ssget "_X")))
   )
   (cons T (mcp-ss->result-json ss (mcp-json-get-limit params)))
+)
+
+;; --- Entity query: find_text (plain-text search incl. block attributes) ---
+
+(defun mcp-mtext-plain (s / p)
+  "Strip common MTEXT formatting so text reads (and matches) as plain text.
+   Drops leading {\\f...; style runs and trailing braces, turns \\P into a
+   space. Pragmatic, not a full MTEXT parser — stacked text (\\S) and
+   inline overrides mid-string may survive."
+  (if (null s) (setq s ""))
+  (setq s (mcp-str-replace s "\\P" " "))
+  (while (and (>= (strlen s) 2) (= (substr s 1 2) "{\\"))
+    (setq p (vl-string-search ";" s))
+    (if p (setq s (substr s (+ p 2))) (setq s (substr s 3)))
+  )
+  (while (and (> (strlen s) 0) (= (substr s (strlen s) 1) "}"))
+    (setq s (substr s 1 (1- (strlen s))))
+  )
+  s
+)
+
+(defun mcp-text-of (ent / ed etype s)
+  "Plain text of a text-bearing entity, nil for anything else."
+  (setq ed (entget ent))
+  (setq etype (cdr (assoc 0 ed)))
+  (setq s (cdr (assoc 1 ed)))
+  (cond
+    ((null s) nil)
+    ((= etype "MTEXT") (mcp-mtext-plain s))
+    (t s)
+  )
+)
+
+(defun mcp-text-match (s pattern icase)
+  "AutoCAD wildcard match (wcmatch), not regex. Optional case folding."
+  (and s (> (strlen s) 0)
+       (if icase
+         (wcmatch (strcase s) (strcase pattern))
+         (wcmatch s pattern)))
+)
+
+(defun mcp-ssget-scoped (types layer window-str mode / flt pts p1 p2)
+  "ssget for the given DXF types, optionally scoped by layer and window."
+  (setq flt (mcp-build-filter layer types nil))
+  (if (and window-str (> (strlen window-str) 0))
+    (progn
+      (setq pts (mcp-split-string window-str ","))
+      (setq p1 (list (atof (nth 0 pts)) (atof (nth 1 pts))))
+      (setq p2 (list (atof (nth 2 pts)) (atof (nth 3 pts))))
+      (if (and mode (= (strcase mode) "INSIDE"))
+        (ssget "_W" p1 p2 flt)
+        (ssget "_C" p1 p2 flt))
+    )
+    (ssget "_X" flt)
+  )
+)
+
+(defun mcp-find->summary (rec / ent blk ed etype handle elayer p txt s tag)
+  "JSON for one find_text hit. rec = (ename block-name-or-nil)."
+  (setq ent (car rec) blk (cadr rec))
+  (setq ed (entget ent))
+  (setq etype (cdr (assoc 0 ed)))
+  (setq handle (cdr (assoc 5 ed)))
+  (setq elayer (cdr (assoc 8 ed)))
+  (setq s (strcat "{\"type\":\"" etype
+                  "\",\"handle\":\"" handle
+                  "\",\"layer\":\"" (mcp-escape-string elayer) "\""))
+  (setq p (cdr (assoc 10 ed)))
+  (if p
+    (setq s (strcat s ",\"point\":[" (rtos (car p) 2 6) "," (rtos (cadr p) 2 6) "]"))
+  )
+  (setq txt (mcp-text-of ent))
+  (if txt (setq s (strcat s ",\"text\":\"" (mcp-escape-string txt) "\"")))
+  (setq tag (cdr (assoc 2 ed)))
+  (if (and tag (= etype "ATTRIB"))
+    (setq s (strcat s ",\"tag\":\"" (mcp-escape-string tag) "\""))
+  )
+  (if blk (setq s (strcat s ",\"block\":\"" (mcp-escape-string blk) "\"")))
+  (strcat s "}")
+)
+
+(defun mcp-recs->result-json (recs limit / total returned body i)
+  "Envelope for a list of find_text records (same shape as query)."
+  (setq total (length recs))
+  (setq returned (if (and limit (> limit 0) (< limit total)) limit total))
+  (setq body "" i 0)
+  (while (< i returned)
+    (if (> (strlen body) 0) (setq body (strcat body ",")))
+    (setq body (strcat body (mcp-find->summary (nth i recs))))
+    (setq i (1+ i))
+  )
+  (strcat "{\"count\":" (itoa total)
+          ",\"returned\":" (itoa returned)
+          ",\"truncated\":" (if (< returned total) "true" "false")
+          ",\"entities\":[" body "]}")
+)
+
+(defun mcp-cmd-entity-find-text (params / pattern layer window-str mode limit icase
+                                 inc-attribs ss i n ent ed recs blkname sub sed setype)
+  "Search TEXT/MTEXT/ATTDEF and (optionally) block ATTRIBs for a wildcard."
+  (setq pattern (mcp-json-get-string params "pattern"))
+  (if (or (null pattern) (= pattern ""))
+    (cons nil "pattern parameter required")
+    (progn
+      (setq layer (mcp-json-get-string params "layer"))
+      (setq window-str (mcp-json-get-string params "window_str"))
+      (setq mode (mcp-json-get-string params "mode"))
+      (setq limit (mcp-json-get-limit params))
+      (setq icase (mcp-json-get-number params "ignore_case"))
+      (setq icase (if (null icase) T (/= icase 0)))
+      (setq inc-attribs (mcp-json-get-number params "include_attribs"))
+      (setq inc-attribs (if (null inc-attribs) T (/= inc-attribs 0)))
+      (setq recs '())
+
+      ;; Pass A — standalone text entities
+      (setq ss (mcp-ssget-scoped "TEXT,MTEXT,ATTDEF" layer window-str mode))
+      (if ss
+        (progn
+          (setq i 0 n (sslength ss))
+          (while (< i n)
+            (setq ent (ssname ss i))
+            (if (mcp-text-match (mcp-text-of ent) pattern icase)
+              (setq recs (cons (list ent nil) recs))
+            )
+            (setq i (1+ i))
+          )
+        )
+      )
+
+      ;; Pass B — ATTRIBs, which ssget cannot select directly: walk each
+      ;; INSERT's sub-entities. Group 66 = "attributes follow"; without that
+      ;; guard entnext would walk on into unrelated database entities.
+      ;; Note: the layer filter matches the INSERT, not the ATTRIB itself.
+      (if inc-attribs
+        (progn
+          (setq ss (mcp-ssget-scoped "INSERT" layer window-str mode))
+          (if ss
+            (progn
+              (setq i 0 n (sslength ss))
+              (while (< i n)
+                (setq ent (ssname ss i))
+                (setq ed (entget ent))
+                (if (and (assoc 66 ed) (= 1 (cdr (assoc 66 ed))))
+                  (progn
+                    (setq blkname (cdr (assoc 2 ed)))
+                    (setq sub (entnext ent))
+                    (while sub
+                      (setq sed (entget sub))
+                      (setq setype (cdr (assoc 0 sed)))
+                      (if (= setype "SEQEND")
+                        (setq sub nil)
+                        (progn
+                          (if (and (= setype "ATTRIB")
+                                   (mcp-text-match (mcp-text-of sub) pattern icase))
+                            (setq recs (cons (list sub blkname) recs))
+                          )
+                          (setq sub (entnext sub))
+                        )
+                      )
+                    )
+                  )
+                )
+                (setq i (1+ i))
+              )
+            )
+          )
+        )
+      )
+      (cons T (mcp-recs->result-json (reverse recs) limit))
+    )
+  )
 )
 
 ;; --- Entity modification commands ---

@@ -224,7 +224,9 @@ class EzdxfBackend(AutoCADBackend):
         )
 
     async def entity_query(self, layer=None, etype=None, text=None, window=None, mode="crossing", limit=None) -> CommandResult:
-        from fnmatch import fnmatch
+        # fnmatchcase, not fnmatch: fnmatch folds case on Windows only, so the
+        # match would be platform-dependent. Case folding is explicit below.
+        from fnmatch import fnmatchcase as fnmatch
 
         layer_pats = [p.strip().upper() for p in layer.split(",")] if layer else None
         type_pats = [p.strip().upper() for p in etype.split(",")] if etype else None
@@ -292,6 +294,102 @@ class EzdxfBackend(AutoCADBackend):
             "returned": len(entities),
             "truncated": len(entities) < total,
             "entities": entities,
+        })
+
+    async def entity_find_text(self, pattern, layer=None, window=None, mode="crossing",
+                               limit=None, ignore_case=True, include_attribs=True) -> CommandResult:
+        # fnmatchcase, not fnmatch: fnmatch folds case on Windows only, which
+        # would silently override ignore_case=False. Fold explicitly instead.
+        from fnmatch import fnmatchcase as fnmatch
+
+        pat = pattern.upper() if ignore_case else pattern
+        layer_pats = [p.strip().upper() for p in layer.split(",")] if layer else None
+        if window:
+            x1, y1, x2, y2 = window
+            wxmin, wxmax = min(x1, x2), max(x1, x2)
+            wymin, wymax = min(y1, y2), max(y1, y2)
+            from ezdxf import bbox
+
+        def _plain(e):
+            t = e.dxftype()
+            if t == "MTEXT":
+                try:
+                    return e.plain_text()
+                except Exception:
+                    return getattr(e, "text", None)
+            if t in ("TEXT", "ATTRIB", "ATTDEF"):
+                return e.dxf.get("text", None)
+            return None
+
+        def _match(s):
+            if not s:
+                return False
+            return fnmatch(s.upper() if ignore_case else s, pat)
+
+        def _in_window(e):
+            ebox = bbox.extents([e])
+            if not ebox.has_data:
+                return False
+            emin_x, emin_y = ebox.extmin.x, ebox.extmin.y
+            emax_x, emax_y = ebox.extmax.x, ebox.extmax.y
+            if mode == "inside":
+                return emin_x >= wxmin and emax_x <= wxmax and emin_y >= wymin and emax_y <= wymax
+            return not (emax_x < wxmin or emin_x > wxmax or emax_y < wymin or emin_y > wymax)
+
+        def _point(e):
+            try:
+                return [round(v, 6) for v in list(e.dxf.insert)[:2]]
+            except Exception:
+                return None
+
+        hits = []
+        for e in self._msp:
+            etp = e.dxftype()
+            if etp not in ("TEXT", "MTEXT", "ATTDEF", "INSERT"):
+                continue
+            elayer = e.dxf.get("layer", "0")
+            if layer_pats and not any(fnmatch(elayer.upper(), p) for p in layer_pats):
+                continue
+            if window and not _in_window(e):
+                continue
+
+            if etp == "INSERT":
+                # ATTRIBs are sub-entities; the layer/window filter above
+                # matched the INSERT, not the ATTRIB itself.
+                if not include_attribs:
+                    continue
+                for att in e.attribs:
+                    txt = _plain(att)
+                    if not _match(txt):
+                        continue
+                    item = {
+                        "type": "ATTRIB", "handle": att.dxf.handle,
+                        "layer": att.dxf.get("layer", "0"), "text": txt,
+                        "tag": att.dxf.get("tag", ""), "block": e.dxf.get("name", ""),
+                    }
+                    pt = _point(att)
+                    if pt is not None:
+                        item["point"] = pt
+                    hits.append(item)
+                continue
+
+            txt = _plain(e)
+            if not _match(txt):
+                continue
+            item = {"type": etp, "handle": e.dxf.handle, "layer": elayer, "text": txt}
+            pt = _point(e)
+            if pt is not None:
+                item["point"] = pt
+            hits.append(item)
+
+        total = len(hits)
+        if limit and limit > 0:
+            hits = hits[:limit]
+        return CommandResult(ok=True, payload={
+            "count": total,
+            "returned": len(hits),
+            "truncated": len(hits) < total,
+            "entities": hits,
         })
 
     async def entity_erase(self, entity_id) -> CommandResult:

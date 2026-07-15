@@ -160,6 +160,18 @@ class AutoCADBackend(ABC):
     ) -> CommandResult:
         return CommandResult(ok=False, error="Not supported on this backend")
 
+    async def entity_find_text(
+        self,
+        pattern: str,
+        layer: str | None = None,
+        window: list[float] | None = None,
+        mode: str = "crossing",
+        limit: int | None = None,
+        ignore_case: bool = True,
+        include_attribs: bool = True,
+    ) -> CommandResult:
+        return CommandResult(ok=False, error="Not supported on this backend")
+
     async def entity_erase(self, entity_id: str) -> CommandResult:
         return CommandResult(ok=False, error="Not supported on this backend")
 

@@ -143,8 +143,18 @@ async def entity(
                             text   — group-1 wildcard for TEXT/MTEXT/ATTRIB, e.g. "*3F*"
                             window — spatial box; mode "crossing" (default) or "inside"
                             limit  — max entities returned (default 200; 0 = no cap)
+      find_text         — Search drawing text, including block attributes.
+                          data: {pattern, layer?, window?, mode?, limit?,
+                                 ignore_case?, include_attribs?}
+                            pattern — AutoCAD wildcard, NOT regex: * ? # @ ~ [] ,
+                                      e.g. "*3F*", "#F", "A-##"
+                          Unlike query's text filter, this matches MTEXT with its
+                          formatting codes stripped, and reaches ATTRIB text inside
+                          block inserts (ssget cannot select those directly).
+                          ATTRIB hits also carry {tag, block}. When filtering by
+                          layer/window, an ATTRIB is matched via its INSERT.
 
-    Both reads return:
+    These reads return:
       {count, returned, truncated, entities: [{type, handle, layer, point?, text?}]}
       count is the full match total even when truncated, so a capped result
       still tells you how many exist. Raise limit (or 0) to fetch more, but an
@@ -197,6 +207,14 @@ async def entity(
             data.get("layer"), data.get("etype"), data.get("text"),
             data.get("window"), data.get("mode", "crossing"),
             int(data.get("limit", DEFAULT_READ_LIMIT)),
+        )
+    elif operation == "find_text":
+        result = await backend.entity_find_text(
+            data["pattern"], data.get("layer"),
+            data.get("window"), data.get("mode", "crossing"),
+            int(data.get("limit", DEFAULT_READ_LIMIT)),
+            bool(data.get("ignore_case", True)),
+            bool(data.get("include_attribs", True)),
         )
     # --- Modify ---
     elif operation == "copy":
