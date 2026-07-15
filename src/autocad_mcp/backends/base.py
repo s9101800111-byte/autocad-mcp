@@ -248,6 +248,16 @@ class AutoCADBackend(ABC):
     async def block_define(self, name: str, entities: list[dict]) -> CommandResult:
         return CommandResult(ok=False, error="Not supported on this backend")
 
+    async def block_extract_attributes(
+        self,
+        block: str | None = None,
+        layer: str | None = None,
+        window: list[float] | None = None,
+        mode: str = "crossing",
+        limit: int | None = None,
+    ) -> CommandResult:
+        return CommandResult(ok=False, error="Not supported on this backend")
+
     # --- Annotation ---
 
     async def create_text(self, x: float, y: float, text: str, height: float = 2.5, rotation: float = 0.0, layer: str | None = None) -> CommandResult:

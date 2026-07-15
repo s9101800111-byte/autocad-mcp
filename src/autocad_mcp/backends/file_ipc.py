@@ -504,6 +504,14 @@ class FileIPCBackend(AutoCADBackend):
     async def block_define(self, name, entities) -> CommandResult:
         return await self._dispatch("block-define", {"name": name, "entities": entities})
 
+    async def block_extract_attributes(self, block=None, layer=None, window=None,
+                                       mode="crossing", limit=None) -> CommandResult:
+        window_str = ",".join(str(v) for v in window) if window else None
+        return await self._dispatch("block-extract-attributes", {
+            "block": block, "layer": layer,
+            "window_str": window_str, "mode": mode, "limit": limit,
+        })
+
     # --- Annotation ---
 
     async def create_text(self, x, y, text, height=2.5, rotation=0.0, layer=None) -> CommandResult:

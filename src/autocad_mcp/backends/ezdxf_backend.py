@@ -392,6 +392,63 @@ class EzdxfBackend(AutoCADBackend):
             "entities": hits,
         })
 
+    async def block_extract_attributes(self, block=None, layer=None, window=None,
+                                       mode="crossing", limit=None) -> CommandResult:
+        from fnmatch import fnmatchcase as fnmatch
+
+        blk_pats = [p.strip().upper() for p in block.split(",")] if block else None
+        layer_pats = [p.strip().upper() for p in layer.split(",")] if layer else None
+        if window:
+            x1, y1, x2, y2 = window
+            wxmin, wxmax = min(x1, x2), max(x1, x2)
+            wymin, wymax = min(y1, y2), max(y1, y2)
+            from ezdxf import bbox
+
+        blocks = []
+        for e in self._msp:
+            if e.dxftype() != "INSERT":
+                continue
+            name = e.dxf.get("name", "")
+            if blk_pats and not any(fnmatch(name.upper(), p) for p in blk_pats):
+                continue
+            elayer = e.dxf.get("layer", "0")
+            if layer_pats and not any(fnmatch(elayer.upper(), p) for p in layer_pats):
+                continue
+            attribs = list(e.attribs)
+            if not attribs:
+                continue
+            if window:
+                ebox = bbox.extents([e])
+                if not ebox.has_data:
+                    continue
+                emin_x, emin_y = ebox.extmin.x, ebox.extmin.y
+                emax_x, emax_y = ebox.extmax.x, ebox.extmax.y
+                if mode == "inside":
+                    if not (emin_x >= wxmin and emax_x <= wxmax and emin_y >= wymin and emax_y <= wymax):
+                        continue
+                elif emax_x < wxmin or emin_x > wxmax or emax_y < wymin or emin_y > wymax:
+                    continue
+
+            item = {
+                "block": name, "handle": e.dxf.handle, "layer": elayer,
+                "attributes": {a.dxf.get("tag", ""): a.dxf.get("text", "") for a in attribs},
+            }
+            try:
+                item["point"] = [round(v, 6) for v in list(e.dxf.insert)[:2]]
+            except Exception:
+                pass
+            blocks.append(item)
+
+        total = len(blocks)
+        if limit and limit > 0:
+            blocks = blocks[:limit]
+        return CommandResult(ok=True, payload={
+            "count": total,
+            "returned": len(blocks),
+            "truncated": len(blocks) < total,
+            "blocks": blocks,
+        })
+
     async def entity_erase(self, entity_id) -> CommandResult:
         try:
             e = self._doc.entitydb.get(entity_id)

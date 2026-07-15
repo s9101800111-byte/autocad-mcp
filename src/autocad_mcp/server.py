@@ -418,6 +418,18 @@ async def block(
       get_attributes       — data: {entity_id}
       update_attribute     — data: {entity_id, tag, value}
       define               — data: {name, entities: [{type, ...}]}
+      extract_attributes_csv — Every attributed insert in one table.
+        data: {block?, layer?, window?, mode?, limit?, path?, overwrite?}
+          block  — block name wildcard/comma-OR, e.g. "A-圖框", "W-*"
+          path   — write a CSV here; without it the rows are just returned
+          limit  — 0 (default) means no cap: an export should be complete.
+                   A huge uncapped set can blow the IPC timeout — narrow it
+                   with block/layer instead. Truncation is always reported.
+        → {count, returned, truncated, blocks: [{block, handle, layer,
+           point, attributes: {tag: value}}], csv?: {path, rows, columns}}
+        CSV columns are block, handle, layer, x, y + the union of every tag
+        seen, so mixed block types give a sparse table. Written UTF-8 with a
+        BOM so Excel reads CJK tags correctly.
     """
     data = data or {}
     backend = await get_backend()
@@ -440,10 +452,54 @@ async def block(
         result = await backend.block_update_attribute(data["entity_id"], data["tag"], data["value"])
     elif operation == "define":
         result = await backend.block_define(data["name"], data.get("entities", []))
+    elif operation == "extract_attributes_csv":
+        result = await backend.block_extract_attributes(
+            data.get("block"), data.get("layer"), data.get("window"),
+            data.get("mode", "crossing"), int(data.get("limit", 0)),
+        )
+        path = data.get("path")
+        if result.ok and path:
+            try:
+                result.payload["csv"] = _write_attributes_csv(
+                    path, result.payload.get("blocks", []), bool(data.get("overwrite", False))
+                )
+            except Exception as e:
+                result = CommandResult(ok=False, error=f"CSV write failed: {e}")
     else:
         return _json({"error": f"Unknown block operation: {operation}"})
 
     return await add_screenshot_if_available(result, include_screenshot)
+
+
+def _write_attributes_csv(path: str, blocks: list, overwrite: bool = False) -> dict:
+    """Write extracted block attributes to CSV. Returns {path, rows, columns}.
+
+    Columns are the fixed fields plus the union of every tag seen, so mixed
+    block types produce a sparse table rather than losing columns.
+    """
+    import csv
+    from pathlib import Path
+
+    p = Path(path)
+    if p.exists() and not overwrite:
+        raise FileExistsError(f"{p} exists — pass overwrite: true to replace it")
+    p.parent.mkdir(parents=True, exist_ok=True)
+
+    tags = sorted({t for b in blocks for t in (b.get("attributes") or {})})
+    columns = ["block", "handle", "layer", "x", "y"] + tags
+
+    # utf-8-sig: Excel misreads plain UTF-8 CSV with CJK tags.
+    with p.open("w", newline="", encoding="utf-8-sig") as f:
+        w = csv.writer(f)
+        w.writerow(columns)
+        for b in blocks:
+            pt = b.get("point") or ["", ""]
+            attrs = b.get("attributes") or {}
+            w.writerow(
+                [b.get("block", ""), b.get("handle", ""), b.get("layer", ""), pt[0], pt[1]]
+                + [attrs.get(t, "") for t in tags]
+            )
+    return {"path": str(p), "rows": len(blocks), "columns": columns}
 
 
 # ==========================================================================

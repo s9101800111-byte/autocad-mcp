@@ -386,6 +386,9 @@
     ((= cmd-name "block-insert-with-attributes")
      (mcp-cmd-block-insert-with-attribs params-json))
 
+    ((= cmd-name "block-extract-attributes")
+     (mcp-cmd-block-extract-attributes params-json))
+
     ((= cmd-name "block-get-attributes")
      (mcp-cmd-block-get-attributes params-json))
 
@@ -1146,6 +1149,103 @@
       (cons T (mcp-recs->result-json (reverse recs) limit))
     )
   )
+)
+
+;; --- Block attribute extraction ---
+
+(defun mcp-ssget-inserts (blk layer window-str mode / flt pts p1 p2)
+  "ssget for INSERTs, optionally scoped by block name / layer / window.
+   The has-attributes test (group 66) is done per entity in the caller —
+   group 66 is not reliably filterable through ssget."
+  (setq flt (list (cons 0 "INSERT")))
+  (if (and blk (> (strlen blk) 0)) (setq flt (cons (cons 2 blk) flt)))
+  (if (and layer (> (strlen layer) 0)) (setq flt (cons (cons 8 layer) flt)))
+  (if (and window-str (> (strlen window-str) 0))
+    (progn
+      (setq pts (mcp-split-string window-str ","))
+      (setq p1 (list (atof (nth 0 pts)) (atof (nth 1 pts))))
+      (setq p2 (list (atof (nth 2 pts)) (atof (nth 3 pts))))
+      (if (and mode (= (strcase mode) "INSIDE"))
+        (ssget "_W" p1 p2 flt)
+        (ssget "_C" p1 p2 flt))
+    )
+    (ssget "_X" flt)
+  )
+)
+
+(defun mcp-insert->attrs-json (ent / ed blk handle elayer p sub sed setype attrs s v)
+  "JSON for one attributed INSERT: block, handle, layer, point, attributes{}."
+  (setq ed (entget ent))
+  (setq blk (cdr (assoc 2 ed)))
+  (setq handle (cdr (assoc 5 ed)))
+  (setq elayer (cdr (assoc 8 ed)))
+  (setq p (cdr (assoc 10 ed)))
+  (setq attrs "")
+  (setq sub (entnext ent))
+  (while sub
+    (setq sed (entget sub))
+    (setq setype (cdr (assoc 0 sed)))
+    (if (= setype "SEQEND")
+      (setq sub nil)
+      (progn
+        (if (= setype "ATTRIB")
+          (progn
+            (setq v (mcp-text-of sub))
+            (if (> (strlen attrs) 0) (setq attrs (strcat attrs ",")))
+            (setq attrs (strcat attrs
+                                "\"" (mcp-escape-string (cdr (assoc 2 sed))) "\":"
+                                "\"" (mcp-escape-string v) "\""))
+          )
+        )
+        (setq sub (entnext sub))
+      )
+    )
+  )
+  (setq s (strcat "{\"block\":\"" (mcp-escape-string blk)
+                  "\",\"handle\":\"" handle
+                  "\",\"layer\":\"" (mcp-escape-string elayer) "\""))
+  (if p
+    (setq s (strcat s ",\"point\":[" (rtos (car p) 2 6) "," (rtos (cadr p) 2 6) "]"))
+  )
+  (strcat s ",\"attributes\":{" attrs "}}")
+)
+
+(defun mcp-cmd-block-extract-attributes (params / blk layer window-str mode limit
+                                         ss i n ent ed recs total returned body)
+  "Collect every attributed INSERT with its tag/value pairs."
+  (setq blk (mcp-json-get-string params "block"))
+  (setq layer (mcp-json-get-string params "layer"))
+  (setq window-str (mcp-json-get-string params "window_str"))
+  (setq mode (mcp-json-get-string params "mode"))
+  (setq limit (mcp-json-get-limit params))
+  (setq ss (mcp-ssget-inserts blk layer window-str mode))
+  (setq recs '())
+  (if ss
+    (progn
+      (setq i 0 n (sslength ss))
+      (while (< i n)
+        (setq ent (ssname ss i))
+        (setq ed (entget ent))
+        (if (and (assoc 66 ed) (= 1 (cdr (assoc 66 ed))))
+          (setq recs (cons ent recs))
+        )
+        (setq i (1+ i))
+      )
+    )
+  )
+  (setq recs (reverse recs))
+  (setq total (length recs))
+  (setq returned (if (and limit (> limit 0) (< limit total)) limit total))
+  (setq body "" i 0)
+  (while (< i returned)
+    (if (> (strlen body) 0) (setq body (strcat body ",")))
+    (setq body (strcat body (mcp-insert->attrs-json (nth i recs))))
+    (setq i (1+ i))
+  )
+  (cons T (strcat "{\"count\":" (itoa total)
+                  ",\"returned\":" (itoa returned)
+                  ",\"truncated\":" (if (< returned total) "true" "false")
+                  ",\"blocks\":[" body "]}"))
 )
 
 ;; --- Entity modification commands ---
