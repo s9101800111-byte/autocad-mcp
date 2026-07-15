@@ -177,10 +177,11 @@ async def entity(
     Batch:
       batch — Run several entity operations in one tool call.
               data: {ops: [{op, ...params}, ...], stop_on_error?}
-              Each op is a flat dict: {"op": "create_line", "x1": 0, "y1": 0,
-              "x2": 10, "y2": 0, "layer": "A-WALL"}. Params that this tool takes
-              at top level (x1/y1/x2/y2/points/layer/entity_id) go at the op's
-              top level; everything else lands in that op's data.
+              Each op is a flat dict — write every param at the op's top level,
+              whether the op normally takes it as an argument or inside data:
+                {"op": "create_line", "x1": 0, "y1": 0, "x2": 10, "y2": 0,
+                 "layer": "A-WALL"}
+                {"op": "query", "layer": "A-GRID", "etype": "LINE", "limit": 50}
               stop_on_error defaults true — set false to run the rest anyway.
               → {count, executed, ok_count, failed_count, stopped_early,
                  results: [{index, op, ok, payload?|error?}]}
@@ -287,8 +288,11 @@ async def _entity_dispatch(
     return result
 
 
-# Params the entity tool takes at top level; anything else in a batch op dict
-# is that op's `data`. Keeps batch ops flat despite the split calling convention.
+# Params the entity tool takes at top level. A batch op is a flat dict, so these
+# are lifted out — but they are ALSO left in the op's `data`, because the two
+# calling conventions overlap: count/list read `layer` as a top-level arg while
+# query/find_text read it out of `data`. Passing both lets each op read from
+# where it expects; the other copy is simply ignored.
 _BATCH_TOP_LEVEL = {"x1", "y1", "x2", "y2", "points", "layer", "entity_id"}
 
 
@@ -316,7 +320,7 @@ async def _entity_batch(backend, ops: list, stop_on_error: bool = True) -> Comma
             continue
 
         top = {k: v for k, v in o.items() if k in _BATCH_TOP_LEVEL}
-        op_data = {k: v for k, v in o.items() if k not in _BATCH_TOP_LEVEL and k != "op"}
+        op_data = {k: v for k, v in o.items() if k != "op"}
         try:
             r = await _entity_dispatch(backend, name, data=op_data, **top)
         except Exception as e:  # a bad op must not abort the whole batch report
