@@ -216,6 +216,40 @@ class EzdxfBackend(AutoCADBackend):
         except Exception as ex:
             return CommandResult(ok=False, error=str(ex))
 
+    async def drawing_get_units_and_base(self) -> CommandResult:
+        h = self._doc.header
+
+        def pt(name):
+            v = h.get(name)
+            if v is None:
+                return None
+            return [round(float(c), 6) for c in tuple(v)]
+
+        return CommandResult(ok=True, payload={
+            "dwgname": os.path.basename(self._save_path) if self._save_path else "",
+            "insunits": h.get("$INSUNITS", 0),
+            "measurement": h.get("$MEASUREMENT", 0),
+            "lunits": h.get("$LUNITS", 2),
+            "luprec": h.get("$LUPREC", 4),
+            "aunits": h.get("$AUNITS", 0),
+            "auprec": h.get("$AUPREC", 0),
+            "insbase": pt("$INSBASE"),
+            "ucsname": h.get("$UCSNAME", ""),
+            "ucsorg": pt("$UCSORG"),
+            "ucsxdir": pt("$UCSXDIR"),
+            "ucsydir": pt("$UCSYDIR"),
+            "extmin": pt("$EXTMIN"),
+            "extmax": pt("$EXTMAX"),
+            "limmin": pt("$LIMMIN"),
+            "limmax": pt("$LIMMAX"),
+            "ctab": "Model",
+            "tilemode": h.get("$TILEMODE", 1),
+        })
+
+    async def drawing_set_insertion_base(self, x, y, z=0.0) -> CommandResult:
+        self._doc.header["$INSBASE"] = (x, y, z)
+        return CommandResult(ok=True, payload={"insbase": [x, y, z]})
+
     async def entity_get_selection(self, limit=None) -> CommandResult:
         return CommandResult(
             ok=False,

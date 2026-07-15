@@ -87,6 +87,12 @@ class AutoCADBackend(ABC):
     async def drawing_open(self, path: str) -> CommandResult:
         return CommandResult(ok=False, error="Not supported on this backend")
 
+    async def drawing_get_units_and_base(self) -> CommandResult:
+        return CommandResult(ok=False, error="Not supported on this backend")
+
+    async def drawing_set_insertion_base(self, x: float, y: float, z: float = 0.0) -> CommandResult:
+        return CommandResult(ok=False, error="Not supported on this backend")
+
     async def drawing_wblock_by_regions(
         self,
         boundary_layer: str,

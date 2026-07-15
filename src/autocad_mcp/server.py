@@ -26,6 +26,85 @@ ToolResult = str | list
 # Truncation is always reported (never silent) — see the entity docstring.
 DEFAULT_READ_LIMIT = 200
 
+# INSUNITS codes — nobody remembers that 4 means millimetres.
+_INSUNITS_NAMES = {
+    0: "unitless", 1: "inches", 2: "feet", 3: "miles", 4: "millimeters",
+    5: "centimeters", 6: "meters", 7: "kilometers", 8: "microinches", 9: "mils",
+    10: "yards", 11: "angstroms", 12: "nanometers", 13: "microns", 14: "decimeters",
+    15: "decameters", 16: "hectometers", 17: "gigameters", 18: "astronomical units",
+    19: "light years", 20: "parsecs", 21: "us survey feet", 22: "us survey inch",
+    23: "us survey yard", 24: "us survey mile",
+}
+
+
+# Metres per drawing unit, for the units that show up in practice.
+_INSUNITS_METRES = {
+    1: 0.0254, 2: 0.3048, 3: 1609.344, 4: 0.001, 5: 0.01, 6: 1.0, 7: 1000.0,
+    10: 0.9144, 14: 0.1, 15: 10.0, 16: 100.0,
+}
+
+
+def _extent_span(p: dict) -> dict | None:
+    """Drawing extents as a span, plus the real-world size the declared units imply.
+
+    A declared unit is only ever wrong in context: seeing "spans 3492 m" next to
+    "centimeters" is what makes a mis-set INSUNITS obvious to a reader. Left as a
+    plain report rather than a warning — plenty of site drawings really are that
+    big, and a guess here would cry wolf.
+    """
+    lo, hi = p.get("extmin"), p.get("extmax")
+    if not lo or not hi:
+        return None
+    span = {"x": round(hi[0] - lo[0], 6), "y": round(hi[1] - lo[1], 6)}
+    factor = _INSUNITS_METRES.get(p.get("insunits"))
+    if factor:
+        span["meters"] = [round(span["x"] * factor, 3), round(span["y"] * factor, 3)]
+    return span
+
+
+def _units_warnings(p: dict) -> list[str]:
+    """Flag the settings that silently skew a linked/inserted drawing.
+
+    This is the point of reading these values at all: an INSUNITS of 0 or a
+    shifted base/UCS does not fail loudly, it just puts the geometry in the
+    wrong place or at the wrong scale after the link.
+    """
+    warnings = []
+
+    if p.get("insunits") == 0:
+        warnings.append(
+            "INSUNITS is 0 (unitless): AutoCAD cannot rescale this drawing on "
+            "insert/link, so it lands at whatever the target's units imply. Set "
+            "INSUNITS before linking."
+        )
+
+    def moved(v):
+        return v is not None and any(abs(float(c)) > 1e-9 for c in v)
+
+    if moved(p.get("insbase")):
+        warnings.append(
+            f"INSBASE is {p['insbase']}, not the origin: an insert lands offset "
+            "by this vector."
+        )
+    if moved(p.get("ucsorg")):
+        warnings.append(
+            f"UCS origin is {p['ucsorg']}, not the WCS origin. Coordinates this "
+            "server reads and writes are WCS, so they will not match what you "
+            "pick on screen."
+        )
+
+    x, y = p.get("ucsxdir"), p.get("ucsydir")
+    rotated = (x is not None and (abs(x[0] - 1) > 1e-9 or abs(x[1]) > 1e-9)) or (
+        y is not None and (abs(y[0]) > 1e-9 or abs(y[1] - 1) > 1e-9)
+    )
+    if rotated:
+        warnings.append(
+            f"UCS is rotated (X axis {x}, Y axis {y}); the same caveat as a "
+            "shifted origin applies."
+        )
+
+    return warnings
+
 log = structlog.get_logger()
 
 mcp = FastMCP("autocad-mcp")
@@ -54,6 +133,20 @@ async def drawing(
       plot_pdf   — Plot to PDF. data: {path}
       purge      — Purge unused objects.
       get_variables — Get system variables. data: {names: [...]}
+      get_units_and_base — What decides whether this drawing lands correctly
+        when linked or inserted: units, insertion base, active UCS, extents.
+        → {insunits, insunits_name, measurement, insbase, ucsname, ucsorg,
+           ucsxdir, ucsydir, extmin, extmax, extent_span, limmin, limmax,
+           lunits, luprec, aunits, auprec, ctab, tilemode, dwgname,
+           warnings: [...]}
+        warnings flags what silently skews a link: unitless INSUNITS, an
+        insertion base off the origin, a shifted or rotated UCS. Worth
+        checking before link_cads_by_floor — none of these fail loudly.
+        extent_span gives the drawing size in the declared units and in
+        metres; a mis-set INSUNITS shows up there as an implausible size
+        rather than as an error. limmin/limmax are usually a stale default
+        and say nothing about the units — don't read them as evidence.
+      set_insertion_base — data: {x, y, z?}  Sets INSBASE.
       undo       — Undo last operation.
       redo       — Redo last undone operation.
       wblock_by_regions — Batch WBLOCK by closed polylines on a layer.
@@ -79,6 +172,18 @@ async def drawing(
         result = await backend.drawing_purge()
     elif operation == "get_variables":
         result = await backend.drawing_get_variables(data.get("names"))
+    elif operation == "get_units_and_base":
+        result = await backend.drawing_get_units_and_base()
+        if result.ok and isinstance(result.payload, dict):
+            result.payload["insunits_name"] = _INSUNITS_NAMES.get(
+                result.payload.get("insunits"), "unknown"
+            )
+            result.payload["extent_span"] = _extent_span(result.payload)
+            result.payload["warnings"] = _units_warnings(result.payload)
+    elif operation == "set_insertion_base":
+        result = await backend.drawing_set_insertion_base(
+            data["x"], data["y"], data.get("z", 0.0)
+        )
     elif operation == "open":
         result = await backend.drawing_open(data["path"])
     elif operation == "undo":

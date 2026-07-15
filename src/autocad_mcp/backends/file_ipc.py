@@ -327,6 +327,12 @@ class FileIPCBackend(AutoCADBackend):
     async def drawing_open(self, path: str) -> CommandResult:
         return await self._dispatch("drawing-open", {"path": path})
 
+    async def drawing_get_units_and_base(self) -> CommandResult:
+        return await self._dispatch("drawing-get-units-and-base", {})
+
+    async def drawing_set_insertion_base(self, x, y, z=0.0) -> CommandResult:
+        return await self._dispatch("drawing-set-insertion-base", {"x": x, "y": y, "z": z})
+
     async def drawing_wblock_by_regions(
         self,
         boundary_layer: str,

@@ -189,6 +189,12 @@
     ((= cmd-name "drawing-info")
      (mcp-cmd-drawing-info))
 
+    ((= cmd-name "drawing-get-units-and-base")
+     (mcp-cmd-drawing-get-units-and-base))
+
+    ((= cmd-name "drawing-set-insertion-base")
+     (mcp-cmd-drawing-set-insertion-base params-json))
+
     ;; --- Layer operations ---
     ((= cmd-name "layer-list")
      (mcp-cmd-layer-list))
@@ -1154,6 +1160,59 @@
       )
       (cons T (mcp-recs->result-json (reverse recs) limit))
     )
+  )
+)
+
+;; --- Drawing units / insertion base / UCS ---
+
+(defun mcp-pt->json (p)
+  "JSON array for a 2D or 3D point sysvar, null when absent."
+  (if p
+    (strcat "[" (rtos (car p) 2 6) "," (rtos (cadr p) 2 6)
+            (if (caddr p) (strcat "," (rtos (caddr p) 2 6)) "") "]")
+    "null"
+  )
+)
+
+(defun mcp-cmd-drawing-get-units-and-base ( / ucsname)
+  "Report the values that decide whether a CAD file lands correctly when
+   linked or inserted: units, insertion base, and the active UCS."
+  (setq ucsname (getvar "UCSNAME"))
+  (if (/= (type ucsname) 'STR) (setq ucsname ""))
+  (cons T (strcat
+    "{\"dwgname\":\"" (mcp-escape-string (getvar "DWGNAME"))
+    "\",\"insunits\":" (itoa (getvar "INSUNITS"))
+    ",\"measurement\":" (itoa (getvar "MEASUREMENT"))
+    ",\"lunits\":" (itoa (getvar "LUNITS"))
+    ",\"luprec\":" (itoa (getvar "LUPREC"))
+    ",\"aunits\":" (itoa (getvar "AUNITS"))
+    ",\"auprec\":" (itoa (getvar "AUPREC"))
+    ",\"insbase\":" (mcp-pt->json (getvar "INSBASE"))
+    ",\"ucsname\":\"" (mcp-escape-string ucsname)
+    "\",\"ucsorg\":" (mcp-pt->json (getvar "UCSORG"))
+    ",\"ucsxdir\":" (mcp-pt->json (getvar "UCSXDIR"))
+    ",\"ucsydir\":" (mcp-pt->json (getvar "UCSYDIR"))
+    ",\"extmin\":" (mcp-pt->json (getvar "EXTMIN"))
+    ",\"extmax\":" (mcp-pt->json (getvar "EXTMAX"))
+    ",\"limmin\":" (mcp-pt->json (getvar "LIMMIN"))
+    ",\"limmax\":" (mcp-pt->json (getvar "LIMMAX"))
+    ",\"ctab\":\"" (mcp-escape-string (getvar "CTAB"))
+    "\",\"tilemode\":" (itoa (getvar "TILEMODE"))
+    "}"))
+)
+
+(defun mcp-cmd-drawing-set-insertion-base (params / x y z)
+  "Set INSBASE for the current space."
+  (setq x (mcp-json-get-number params "x"))
+  (setq y (mcp-json-get-number params "y"))
+  (setq z (mcp-json-get-number params "z"))
+  (if (null z) (setq z 0.0))
+  (if (and x y)
+    (progn
+      (setvar "INSBASE" (list x y z))
+      (cons T (strcat "{\"insbase\":" (mcp-pt->json (getvar "INSBASE")) "}"))
+    )
+    (cons nil "x and y are required")
   )
 )
 
