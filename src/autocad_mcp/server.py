@@ -8,6 +8,7 @@ from __future__ import annotations
 import structlog
 from mcp.server.fastmcp import FastMCP
 
+from autocad_mcp.backends.base import CommandResult
 from autocad_mcp.client import (
     _error,
     _json,
@@ -172,9 +173,52 @@ async def entity(
       fillet  — data: {id1, id2, radius}
       chamfer — data: {id1, id2, dist1, dist2}
       erase   — entity_id
+
+    Batch:
+      batch — Run several entity operations in one tool call.
+              data: {ops: [{op, ...params}, ...], stop_on_error?}
+              Each op is a flat dict: {"op": "create_line", "x1": 0, "y1": 0,
+              "x2": 10, "y2": 0, "layer": "A-WALL"}. Params that this tool takes
+              at top level (x1/y1/x2/y2/points/layer/entity_id) go at the op's
+              top level; everything else lands in that op's data.
+              stop_on_error defaults true — set false to run the rest anyway.
+              → {count, executed, ok_count, failed_count, stopped_early,
+                 results: [{index, op, ok, payload?|error?}]}
+              This saves tool-call round-trips, not IPC dispatches: ops still
+              execute sequentially, one AutoCAD dispatch each.
     """
     data = data or {}
     backend = await get_backend()
+
+    if operation == "batch":
+        result = await _entity_batch(
+            backend, data.get("ops") or [], bool(data.get("stop_on_error", True))
+        )
+    else:
+        result = await _entity_dispatch(
+            backend, operation, x1, y1, x2, y2, points, layer, entity_id, data
+        )
+    return await add_screenshot_if_available(result, include_screenshot)
+
+
+async def _entity_dispatch(
+    backend,
+    operation: str,
+    x1: float | None = None,
+    y1: float | None = None,
+    x2: float | None = None,
+    y2: float | None = None,
+    points: list[list[float]] | None = None,
+    layer: str | None = None,
+    entity_id: str | None = None,
+    data: dict | None = None,
+) -> CommandResult:
+    """Route one entity operation to the backend.
+
+    Shared by the entity tool and entity.batch. Returns CommandResult rather
+    than serialized JSON so batch can collect per-op outcomes.
+    """
+    data = data or {}
 
     # --- Create ---
     if operation == "create_line":
@@ -238,9 +282,66 @@ async def entity(
     elif operation == "erase":
         result = await backend.entity_erase(entity_id)
     else:
-        return _json({"error": f"Unknown entity operation: {operation}"})
+        return CommandResult(ok=False, error=f"Unknown entity operation: {operation}")
 
-    return await add_screenshot_if_available(result, include_screenshot)
+    return result
+
+
+# Params the entity tool takes at top level; anything else in a batch op dict
+# is that op's `data`. Keeps batch ops flat despite the split calling convention.
+_BATCH_TOP_LEVEL = {"x1", "y1", "x2", "y2", "points", "layer", "entity_id"}
+
+
+async def _entity_batch(backend, ops: list, stop_on_error: bool = True) -> CommandResult:
+    """Run a list of entity operations sequentially, reporting each outcome."""
+    if not isinstance(ops, list):
+        return CommandResult(ok=False, error="data.ops must be a list of operations")
+
+    results = []
+    stopped_early = False
+    for i, o in enumerate(ops):
+        if not isinstance(o, dict) or not o.get("op"):
+            results.append({"index": i, "ok": False, "error": "each op needs an 'op' key"})
+            if stop_on_error:
+                stopped_early = True
+                break
+            continue
+
+        name = o["op"]
+        if name == "batch":
+            results.append({"index": i, "op": name, "ok": False, "error": "batch cannot nest"})
+            if stop_on_error:
+                stopped_early = True
+                break
+            continue
+
+        top = {k: v for k, v in o.items() if k in _BATCH_TOP_LEVEL}
+        op_data = {k: v for k, v in o.items() if k not in _BATCH_TOP_LEVEL and k != "op"}
+        try:
+            r = await _entity_dispatch(backend, name, data=op_data, **top)
+        except Exception as e:  # a bad op must not abort the whole batch report
+            r = CommandResult(ok=False, error=f"{type(e).__name__}: {e}")
+
+        entry = {"index": i, "op": name, "ok": r.ok}
+        if r.ok:
+            entry["payload"] = r.payload
+        else:
+            entry["error"] = r.error
+        results.append(entry)
+
+        if not r.ok and stop_on_error:
+            stopped_early = True
+            break
+
+    ok_count = sum(1 for r in results if r["ok"])
+    return CommandResult(ok=True, payload={
+        "count": len(ops),
+        "executed": len(results),
+        "ok_count": ok_count,
+        "failed_count": len(results) - ok_count,
+        "stopped_early": stopped_early,
+        "results": results,
+    })
 
 
 # ==========================================================================
