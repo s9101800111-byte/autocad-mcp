@@ -216,14 +216,14 @@ class EzdxfBackend(AutoCADBackend):
         except Exception as ex:
             return CommandResult(ok=False, error=str(ex))
 
-    async def entity_get_selection(self) -> CommandResult:
+    async def entity_get_selection(self, limit=None) -> CommandResult:
         return CommandResult(
             ok=False,
             error="get_selection needs interactive AutoCAD (file_ipc backend); "
             "no implied selection set exists in ezdxf headless mode",
         )
 
-    async def entity_query(self, layer=None, etype=None, text=None, window=None, mode="crossing") -> CommandResult:
+    async def entity_query(self, layer=None, etype=None, text=None, window=None, mode="crossing", limit=None) -> CommandResult:
         from fnmatch import fnmatch
 
         layer_pats = [p.strip().upper() for p in layer.split(",")] if layer else None
@@ -284,7 +284,15 @@ class EzdxfBackend(AutoCADBackend):
                 item["text"] = etext
             entities.append(item)
 
-        return CommandResult(ok=True, payload={"count": len(entities), "entities": entities})
+        total = len(entities)
+        if limit and limit > 0:
+            entities = entities[:limit]
+        return CommandResult(ok=True, payload={
+            "count": total,
+            "returned": len(entities),
+            "truncated": len(entities) < total,
+            "entities": entities,
+        })
 
     async def entity_erase(self, entity_id) -> CommandResult:
         try:

@@ -905,9 +905,9 @@
   (strcat s "}")
 )
 
-(defun mcp-ss->entities-json (ss / i n ent result)
-  "Serialize a selection set to a comma-joined JSON array body."
-  (setq result "" i 0 n (if ss (sslength ss) 0))
+(defun mcp-ss->entities-json (ss n / i ent result)
+  "Serialize the first n entities of a selection set to a JSON array body."
+  (setq result "" i 0)
   (while (< i n)
     (setq ent (ssname ss i))
     (if (> (strlen result) 0) (setq result (strcat result ",")))
@@ -915,6 +915,25 @@
     (setq i (1+ i))
   )
   result
+)
+
+(defun mcp-ss->result-json (ss limit / total returned)
+  "Envelope: {count = total matched, returned, truncated, entities[]}.
+   limit nil or <= 0 means no cap. Building the JSON via strcat is O(n^2),
+   so an unbounded query on a large drawing will blow the IPC timeout —
+   the cap is reported, never silent."
+  (setq total (if ss (sslength ss) 0))
+  (setq returned (if (and limit (> limit 0) (< limit total)) limit total))
+  (strcat "{\"count\":" (itoa total)
+          ",\"returned\":" (itoa returned)
+          ",\"truncated\":" (if (< returned total) "true" "false")
+          ",\"entities\":[" (mcp-ss->entities-json ss returned) "]}")
+)
+
+(defun mcp-json-get-limit (params / v)
+  "Read an integer limit param; nil when absent."
+  (setq v (mcp-json-get-number params "limit"))
+  (if v (fix v))
 )
 
 (defun mcp-build-filter (layer etype text / flt)
@@ -929,11 +948,7 @@
 (defun mcp-cmd-entity-get-selection (params / ss)
   "Return the current implied (pickfirst/grip) selection set."
   (setq ss (ssget "_I"))
-  (if (null ss)
-    (cons T "{\"count\":0,\"entities\":[]}")
-    (cons T (strcat "{\"count\":" (itoa (sslength ss))
-                    ",\"entities\":[" (mcp-ss->entities-json ss) "]}"))
-  )
+  (cons T (mcp-ss->result-json ss (mcp-json-get-limit params)))
 )
 
 (defun mcp-cmd-entity-query (params / layer etype text window-str mode flt pts p1 p2 ss)
@@ -956,11 +971,7 @@
     )
     (setq ss (if flt (ssget "_X" flt) (ssget "_X")))
   )
-  (if (null ss)
-    (cons T "{\"count\":0,\"entities\":[]}")
-    (cons T (strcat "{\"count\":" (itoa (sslength ss))
-                    ",\"entities\":[" (mcp-ss->entities-json ss) "]}"))
-  )
+  (cons T (mcp-ss->result-json ss (mcp-json-get-limit params)))
 )
 
 ;; --- Entity modification commands ---

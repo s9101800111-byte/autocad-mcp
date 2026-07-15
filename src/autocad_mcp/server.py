@@ -20,6 +20,11 @@ from autocad_mcp.client import (
 # ImageContent (screenshot) alongside TextContent need a union return type.
 ToolResult = str | list
 
+# Default cap for entity reads. The LISP side builds its JSON by strcat, which
+# is O(n^2), so an uncapped read of a large drawing exceeds the IPC timeout.
+# Truncation is always reported (never silent) — see the entity docstring.
+DEFAULT_READ_LIMIT = 200
+
 log = structlog.get_logger()
 
 mcp = FastMCP("autocad-mcp")
@@ -130,15 +135,21 @@ async def entity(
       count             — layer? → count entities
       get               — entity_id → entity details
       get_selection     — Read the user's current pick/grip selection in AutoCAD.
-                          → {count, entities: [{type, handle, layer, point?, text?}]}
-                          (File IPC only — needs interactive AutoCAD.)
+                          data: {limit?}  (File IPC only — needs interactive AutoCAD.)
       query             — Filter entities without round-tripping each handle.
-                          data: {layer?, etype?, text?, window?: [x1,y1,x2,y2], mode?}
+                          data: {layer?, etype?, text?, window?: [x1,y1,x2,y2], mode?, limit?}
                             layer  — name/wildcard/comma-OR, e.g. "S-*,A-WALL"
                             etype  — DXF type/comma-OR, e.g. "LINE,LWPOLYLINE"
                             text   — group-1 wildcard for TEXT/MTEXT/ATTRIB, e.g. "*3F*"
                             window — spatial box; mode "crossing" (default) or "inside"
-                          → {count, entities: [{type, handle, layer, point?, text?}]}
+                            limit  — max entities returned (default 200; 0 = no cap)
+
+    Both reads return:
+      {count, returned, truncated, entities: [{type, handle, layer, point?, text?}]}
+      count is the full match total even when truncated, so a capped result
+      still tells you how many exist. Raise limit (or 0) to fetch more, but an
+      uncapped read of thousands of entities will blow the IPC timeout —
+      narrow it with layer/etype/window instead.
 
     Modify operations:
       copy    — entity_id, data: {dx, dy}
@@ -180,11 +191,12 @@ async def entity(
     elif operation == "get":
         result = await backend.entity_get(entity_id)
     elif operation == "get_selection":
-        result = await backend.entity_get_selection()
+        result = await backend.entity_get_selection(int(data.get("limit", DEFAULT_READ_LIMIT)))
     elif operation == "query":
         result = await backend.entity_query(
             data.get("layer"), data.get("etype"), data.get("text"),
             data.get("window"), data.get("mode", "crossing"),
+            int(data.get("limit", DEFAULT_READ_LIMIT)),
         )
     # --- Modify ---
     elif operation == "copy":

@@ -405,16 +405,16 @@ class FileIPCBackend(AutoCADBackend):
     async def entity_get(self, entity_id) -> CommandResult:
         return await self._dispatch("entity-get", {"entity_id": entity_id})
 
-    async def entity_get_selection(self) -> CommandResult:
+    async def entity_get_selection(self, limit=None) -> CommandResult:
         # No ESC prefix — it would clear the grip selection we want to read.
-        return await self._dispatch("entity-get-selection", {}, send_esc=False)
+        return await self._dispatch("entity-get-selection", {"limit": limit}, send_esc=False)
 
-    async def entity_query(self, layer=None, etype=None, text=None, window=None, mode="crossing") -> CommandResult:
+    async def entity_query(self, layer=None, etype=None, text=None, window=None, mode="crossing", limit=None) -> CommandResult:
         # window passed as "x1,y1,x2,y2" string (LISP JSON parser reads scalars only)
         window_str = ",".join(str(v) for v in window) if window else None
         return await self._dispatch("entity-query", {
             "layer": layer, "etype": etype, "text": text,
-            "window_str": window_str, "mode": mode,
+            "window_str": window_str, "mode": mode, "limit": limit,
         })
 
     async def entity_erase(self, entity_id) -> CommandResult:

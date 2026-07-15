@@ -146,7 +146,7 @@ class AutoCADBackend(ABC):
     async def entity_get(self, entity_id: str) -> CommandResult:
         return CommandResult(ok=False, error="Not supported on this backend")
 
-    async def entity_get_selection(self) -> CommandResult:
+    async def entity_get_selection(self, limit: int | None = None) -> CommandResult:
         return CommandResult(ok=False, error="Not supported on this backend")
 
     async def entity_query(
@@ -156,6 +156,7 @@ class AutoCADBackend(ABC):
         text: str | None = None,
         window: list[float] | None = None,
         mode: str = "crossing",
+        limit: int | None = None,
     ) -> CommandResult:
         return CommandResult(ok=False, error="Not supported on this backend")
 
