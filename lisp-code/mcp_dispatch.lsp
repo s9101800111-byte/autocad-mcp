@@ -211,6 +211,9 @@
     ((= cmd-name "layer-lock")
      (mcp-cmd-layer-lock params-json))
 
+    ((= cmd-name "layer-translate")
+     (mcp-cmd-layer-translate params-json))
+
     ((= cmd-name "layer-unlock")
      (mcp-cmd-layer-unlock params-json))
 
@@ -1147,6 +1150,107 @@
         )
       )
       (cons T (mcp-recs->result-json (reverse recs) limit))
+    )
+  )
+)
+
+;; --- Layer translate (mapping table: vendor layers -> company standard) ---
+
+(defun mcp-layer-move-ss (ss to / i n ent ed cnt)
+  "Move every entity of a selection set onto layer `to`.
+   entmod, not CHPROP: the low-level API is unaffected by layer locking
+   and lets us count exactly what moved. Returns the number moved.
+   Note: ssget _X does not reach entities inside block definitions, so
+   geometry within a block keeps its own layer."
+  (setq cnt 0)
+  (if ss
+    (progn
+      (setq i 0 n (sslength ss))
+      (while (< i n)
+        (setq ent (ssname ss i))
+        (setq ed (entget ent))
+        (if (entmod (subst (cons 8 to) (assoc 8 ed) ed))
+          (setq cnt (1+ cnt))
+        )
+        (setq i (1+ i))
+      )
+    )
+  )
+  cnt
+)
+
+(defun mcp-layer-exists-matching (pat / ld found)
+  "Is any layer in the table matching pat (wildcards ok) still present?
+   tblsearch alone cannot answer this: a wildcard never matches a literal
+   table entry, so it would report 'gone' without checking anything."
+  (setq found nil)
+  (setq ld (tblnext "LAYER" T))
+  (while (and ld (not found))
+    (if (wcmatch (strcase (cdr (assoc 2 ld))) (strcase pat)) (setq found T))
+    (setq ld (tblnext "LAYER"))
+  )
+  found
+)
+
+(defun mcp-cmd-layer-translate (params / map-str dry purge pairs pair parts from to
+                                results total cnt existed purged created ss)
+  "Rename/merge layers from a mapping table. map_str = \"OLD>NEW;OLD2>NEW2\"
+   (';' and '>' are illegal in AutoCAD layer names, so they are safe
+   delimiters)."
+  (setq map-str (mcp-json-get-string params "map_str"))
+  (if (or (null map-str) (= map-str ""))
+    (cons nil "map parameter required")
+    (progn
+      (setq dry (mcp-json-get-number params "dry_run"))
+      (setq dry (if (null dry) nil (/= dry 0)))
+      (setq purge (mcp-json-get-number params "purge"))
+      (setq purge (if (null purge) T (/= purge 0)))
+      (setq results "" total 0)
+      (foreach pair (mcp-split-string map-str ";")
+        (setq parts (mcp-split-string pair ">"))
+        (setq from (nth 0 parts))
+        (setq to (nth 1 parts))
+        (if (and from to (> (strlen from) 0) (> (strlen to) 0))
+          (progn
+            (setq existed (if (tblsearch "LAYER" to) T nil))
+            (setq ss (ssget "_X" (list (cons 8 from))))
+            (setq cnt (if ss (sslength ss) 0))
+            (setq created nil purged nil)
+            ;; nothing matched -> do nothing at all; creating the target for a
+            ;; no-op translate would be an unasked-for side effect
+            (if (and (not dry) (> cnt 0))
+              (progn
+                (if (not existed)
+                  (progn (ensure_layer_exists to "white" "CONTINUOUS") (setq created T))
+                )
+                (setq cnt (mcp-layer-move-ss ss to))
+                ;; purge only once the source is empty; it also fails harmlessly
+                ;; while a block definition still references the layer
+                (if (and purge (not (wcmatch (strcase to) (strcase from))))
+                  (progn
+                    (if (wcmatch (strcase (getvar "CLAYER")) (strcase from))
+                      (setvar "CLAYER" to)
+                    )
+                    (command "_.-PURGE" "_LA" from "_N")
+                    (setq purged (not (mcp-layer-exists-matching from)))
+                  )
+                )
+              )
+            )
+            (setq total (+ total cnt))
+            (if (> (strlen results) 0) (setq results (strcat results ",")))
+            (setq results (strcat results
+              "{\"from\":\"" (mcp-escape-string from)
+              "\",\"to\":\"" (mcp-escape-string to)
+              "\",\"entities\":" (itoa cnt)
+              ",\"target_created\":" (if created "true" "false")
+              ",\"source_purged\":" (if purged "true" "false") "}"))
+          )
+        )
+      )
+      (cons T (strcat "{\"dry_run\":" (if dry "true" "false")
+                      ",\"total_entities\":" (itoa total)
+                      ",\"results\":[" results "]}"))
     )
   )
 )

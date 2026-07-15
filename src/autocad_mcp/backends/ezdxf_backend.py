@@ -392,6 +392,58 @@ class EzdxfBackend(AutoCADBackend):
             "entities": hits,
         })
 
+    async def layer_translate(self, mapping, dry_run=False, purge=True) -> CommandResult:
+        from fnmatch import fnmatchcase as fnmatch
+
+        results = []
+        total = 0
+        for src, dst in mapping.items():
+            if not src or not dst:
+                continue
+            hits = [e for e in self._msp if fnmatch(e.dxf.get("layer", "0").upper(), src.upper())]
+            # capture the real layer names now — src may be a wildcard, and
+            # after the move the entities no longer name their old layer
+            src_layers = {e.dxf.get("layer", "0") for e in hits}
+            existed = self._doc.layers.has_entry(dst)
+            created = False
+            purged = False
+            # nothing matched -> do nothing; creating the target for a no-op
+            # translate would be an unasked-for side effect
+            if not dry_run and hits:
+                if not existed:
+                    self._doc.layers.add(dst)
+                    created = True
+                for e in hits:
+                    e.dxf.layer = dst
+                if purge and not fnmatch(dst.upper(), src.upper()):
+                    dropped = []
+                    for name in src_layers:
+                        if name.upper() in ("0", "DEFPOINTS", dst.upper()):
+                            continue
+                        still_used = any(
+                            x.dxf.get("layer", "0").upper() == name.upper() for x in self._msp
+                        )
+                        if not still_used and self._doc.layers.has_entry(name):
+                            try:
+                                self._doc.layers.remove(name)
+                                dropped.append(name)
+                            except Exception:
+                                pass
+                    purged = bool(dropped) and len(dropped) == len(
+                        {n for n in src_layers if n.upper() not in ("0", "DEFPOINTS", dst.upper())}
+                    )
+            total += len(hits)
+            results.append({
+                "from": src, "to": dst, "entities": len(hits),
+                "target_created": created, "source_purged": purged,
+            })
+
+        return CommandResult(ok=True, payload={
+            "dry_run": dry_run,
+            "total_entities": total,
+            "results": results,
+        })
+
     async def block_extract_attributes(self, block=None, layer=None, window=None,
                                        mode="crossing", limit=None) -> CommandResult:
         from fnmatch import fnmatchcase as fnmatch

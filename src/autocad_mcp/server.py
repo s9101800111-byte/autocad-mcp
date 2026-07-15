@@ -371,6 +371,19 @@ async def layer(
       thaw            — data: {name}
       lock            — data: {name}
       unlock          — data: {name}
+      translate       — Rename/merge layers from a mapping table.
+        data: {map: {"OLD": "NEW", ...}, dry_run?, purge?}
+          map     — source may use wildcards ("VENDOR_*": "A-WALL"); several
+                    sources mapping to one target merges them.
+          dry_run — count what would move without touching the drawing.
+                    Run this first: merging discards the original layer
+                    assignment and there is no per-entity undo of the map.
+          purge   — drop each emptied source layer (default true).
+        → {dry_run, total_entities, results: [{from, to, entities,
+           target_created, source_purged}]}
+        Only entities in the drawing move. Geometry inside block definitions
+        keeps its own layer, which is also why a source layer may survive
+        purge — a block definition still references it.
     """
     data = data or {}
     backend = await get_backend()
@@ -391,6 +404,13 @@ async def layer(
         result = await backend.layer_lock(data["name"])
     elif operation == "unlock":
         result = await backend.layer_unlock(data["name"])
+    elif operation == "translate":
+        mapping = data.get("map")
+        if not isinstance(mapping, dict) or not mapping:
+            return _json({"error": "layer.translate needs data.map = {\"OLD\": \"NEW\", ...}"})
+        result = await backend.layer_translate(
+            mapping, bool(data.get("dry_run", False)), bool(data.get("purge", True))
+        )
     else:
         return _json({"error": f"Unknown layer operation: {operation}"})
 

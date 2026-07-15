@@ -484,6 +484,16 @@ class FileIPCBackend(AutoCADBackend):
     async def layer_unlock(self, name) -> CommandResult:
         return await self._dispatch("layer-unlock", {"name": name})
 
+    async def layer_translate(self, mapping, dry_run=False, purge=True) -> CommandResult:
+        # "OLD>NEW;OLD2>NEW2" — ';' and '>' are illegal in AutoCAD layer names,
+        # so they are safe delimiters for the minimal LISP-side parser.
+        map_str = ";".join(f"{k}>{v}" for k, v in mapping.items())
+        return await self._dispatch("layer-translate", {
+            "map_str": map_str,
+            "dry_run": 1 if dry_run else 0,
+            "purge": 1 if purge else 0,
+        })
+
     # --- Block operations ---
 
     async def block_list(self) -> CommandResult:

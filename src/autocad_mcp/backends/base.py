@@ -228,6 +228,14 @@ class AutoCADBackend(ABC):
     async def layer_unlock(self, name: str) -> CommandResult:
         return CommandResult(ok=False, error="Not supported on this backend")
 
+    async def layer_translate(
+        self,
+        mapping: dict[str, str],
+        dry_run: bool = False,
+        purge: bool = True,
+    ) -> CommandResult:
+        return CommandResult(ok=False, error="Not supported on this backend")
+
     # --- Block operations ---
 
     async def block_list(self) -> CommandResult:
