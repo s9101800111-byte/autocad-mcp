@@ -286,6 +286,20 @@ class AutoCADBackend(ABC):
     async def create_leader(self, points: list[list[float]], text: str) -> CommandResult:
         return CommandResult(ok=False, error="Not supported on this backend")
 
+    async def annotation_find_replace(
+        self,
+        find: str,
+        replace: str = "",
+        layer: str | None = None,
+        window: list[float] | None = None,
+        mode: str = "crossing",
+        limit: int | None = None,
+        ignore_case: bool = True,
+        include_attribs: bool = True,
+        dry_run: bool = False,
+    ) -> CommandResult:
+        return CommandResult(ok=False, error="Not supported on this backend")
+
     # --- P&ID ---
 
     async def pid_setup_layers(self) -> CommandResult:

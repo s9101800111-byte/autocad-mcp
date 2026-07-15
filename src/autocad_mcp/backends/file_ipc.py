@@ -543,6 +543,18 @@ class FileIPCBackend(AutoCADBackend):
         pts_str = ";".join(f"{p[0]},{p[1]}" for p in points)
         return await self._dispatch("create-leader", {"points_str": pts_str, "text": text})
 
+    async def annotation_find_replace(self, find, replace="", layer=None, window=None,
+                                      mode="crossing", limit=None, ignore_case=True,
+                                      include_attribs=True, dry_run=False) -> CommandResult:
+        window_str = ",".join(str(v) for v in window) if window else None
+        return await self._dispatch("annotation-find-replace", {
+            "find": find, "replace": replace, "layer": layer,
+            "window_str": window_str, "mode": mode, "limit": limit,
+            "ignore_case": 1 if ignore_case else 0,
+            "include_attribs": 1 if include_attribs else 0,
+            "dry_run": 1 if dry_run else 0,
+        })
+
     # --- P&ID ---
 
     async def pid_setup_layers(self) -> CommandResult:

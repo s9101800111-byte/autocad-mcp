@@ -543,6 +543,19 @@ async def annotation(
       create_dimension_angular — data: {cx, cy, x1, y1, x2, y2}
       create_dimension_radius — data: {cx, cy, radius, angle}
       create_leader           — data: {points: [[x,y],...], text}
+      find_replace            — Substring replace across drawing text.
+        data: {find, replace?, layer?, window?, mode?, limit?,
+               ignore_case?, include_attribs?, dry_run?}
+          find    — a literal substring, not a wildcard or regex.
+          dry_run — preview before/after without writing. Do this first.
+        → {dry_run, count, returned, truncated,
+           entities: [{handle, type, layer, before, after}]}
+        Covers TEXT/MTEXT/ATTDEF and ATTRIB text inside blocks. before/after
+        are the RAW stored text: for MTEXT that includes formatting codes,
+        because the replace runs over the raw string to keep formatting
+        intact. The flip side is that a find string which also occurs in a
+        format code (a font name, say) would corrupt it — dry_run shows
+        exactly what would change, so check it there.
     """
     data = data or {}
     backend = await get_backend()
@@ -570,6 +583,15 @@ async def annotation(
         )
     elif operation == "create_leader":
         result = await backend.create_leader(data["points"], data["text"])
+    elif operation == "find_replace":
+        result = await backend.annotation_find_replace(
+            data["find"], data.get("replace", ""), data.get("layer"),
+            data.get("window"), data.get("mode", "crossing"),
+            int(data.get("limit", DEFAULT_READ_LIMIT)),
+            bool(data.get("ignore_case", True)),
+            bool(data.get("include_attribs", True)),
+            bool(data.get("dry_run", False)),
+        )
     else:
         return _json({"error": f"Unknown annotation operation: {operation}"})
 

@@ -414,6 +414,9 @@
     ((= cmd-name "create-dimension-radius")
      (mcp-cmd-create-dimension-radius params-json))
 
+    ((= cmd-name "annotation-find-replace")
+     (mcp-cmd-annotation-find-replace params-json))
+
     ((= cmd-name "create-leader")
      (mcp-cmd-create-leader params-json))
 
@@ -1150,6 +1153,182 @@
         )
       )
       (cons T (mcp-recs->result-json (reverse recs) limit))
+    )
+  )
+)
+
+;; --- Annotation find/replace ---
+
+(defun mcp-str-replace-ci (s old new / out lu pos)
+  "Case-insensitive replace-all. Splices from the original string so the
+   untouched parts keep their original casing."
+  (cond
+    ((null s) "")
+    ((or (null old) (= old "")) s)
+    (t
+     (progn
+       (if (null new) (setq new ""))
+       (setq out "" lu (strcase old))
+       (while (setq pos (vl-string-search lu (strcase s)))
+         (setq out (strcat out (substr s 1 pos) new))
+         (setq s (substr s (+ pos 1 (strlen old))))
+       )
+       (strcat out s)
+     )
+    )
+  )
+)
+
+(defun mcp-ent-replace-text (ent find repl icase dry / ed etype newed pair k v nv changed)
+  "Substring-replace inside one text entity. Returns T if it changed.
+
+   Runs over the raw DXF text so MTEXT formatting survives the edit.
+   Group 1 is the text on TEXT/MTEXT/ATTRIB/ATTDEF; group 3 is only text on
+   MTEXT (it holds the earlier chunks when the string exceeds 250 chars) —
+   on ATTDEF group 3 is the prompt, which must not be touched."
+  (setq ed (entget ent))
+  (setq etype (cdr (assoc 0 ed)))
+  (setq newed '() changed nil)
+  (foreach pair ed
+    (setq k (car pair) v (cdr pair))
+    (if (and (= (type v) 'STR)
+             (or (= k 1) (and (= k 3) (= etype "MTEXT"))))
+      (progn
+        (setq nv (if icase (mcp-str-replace-ci v find repl) (mcp-str-replace v find repl)))
+        (if (/= nv v) (setq changed T))
+        (setq newed (cons (cons k nv) newed))
+      )
+      (setq newed (cons pair newed))
+    )
+  )
+  (setq newed (reverse newed))
+  (if (and changed (not dry))
+    (progn (entmod newed) (entupd ent))
+  )
+  changed
+)
+
+(defun mcp-ent-raw-text (ent / ed etype out)
+  "Raw group-1 (+ group-3 chunks for MTEXT), as stored."
+  (setq ed (entget ent))
+  (setq etype (cdr (assoc 0 ed)))
+  (setq out "")
+  (foreach pair ed
+    (if (and (= (type (cdr pair)) 'STR)
+             (or (= (car pair) 1) (and (= (car pair) 3) (= etype "MTEXT"))))
+      (setq out (strcat out (cdr pair)))
+    )
+  )
+  out
+)
+
+(defun mcp-cmd-annotation-find-replace (params / find repl layer window-str mode limit
+                                        icase inc-attribs dry ss i n ent ed blkname sub
+                                        sed setype recs before after changed total body
+                                        returned)
+  "Substring find/replace across drawing text, optionally including ATTRIBs."
+  (setq find (mcp-json-get-string params "find"))
+  (if (or (null find) (= find ""))
+    (cons nil "find parameter required")
+    (progn
+      (setq repl (mcp-json-get-string params "replace"))
+      (if (null repl) (setq repl ""))
+      (setq layer (mcp-json-get-string params "layer"))
+      (setq window-str (mcp-json-get-string params "window_str"))
+      (setq mode (mcp-json-get-string params "mode"))
+      (setq limit (mcp-json-get-limit params))
+      (setq icase (mcp-json-get-number params "ignore_case"))
+      (setq icase (if (null icase) T (/= icase 0)))
+      (setq inc-attribs (mcp-json-get-number params "include_attribs"))
+      (setq inc-attribs (if (null inc-attribs) T (/= inc-attribs 0)))
+      (setq dry (mcp-json-get-number params "dry_run"))
+      (setq dry (if (null dry) nil (/= dry 0)))
+      (setq recs '())
+
+      ;; Pass A — standalone text
+      (setq ss (mcp-ssget-scoped "TEXT,MTEXT,ATTDEF" layer window-str mode))
+      (if ss
+        (progn
+          (setq i 0 n (sslength ss))
+          (while (< i n)
+            (setq ent (ssname ss i))
+            (setq before (mcp-ent-raw-text ent))
+            (if (mcp-ent-replace-text ent find repl icase dry)
+              (setq recs (cons (list ent before) recs))
+            )
+            (setq i (1+ i))
+          )
+        )
+      )
+
+      ;; Pass B — ATTRIBs inside attributed INSERTs (ssget cannot select them)
+      (if inc-attribs
+        (progn
+          (setq ss (mcp-ssget-scoped "INSERT" layer window-str mode))
+          (if ss
+            (progn
+              (setq i 0 n (sslength ss))
+              (while (< i n)
+                (setq ent (ssname ss i))
+                (setq ed (entget ent))
+                (if (and (assoc 66 ed) (= 1 (cdr (assoc 66 ed))))
+                  (progn
+                    (setq sub (entnext ent))
+                    (while sub
+                      (setq sed (entget sub))
+                      (setq setype (cdr (assoc 0 sed)))
+                      (if (= setype "SEQEND")
+                        (setq sub nil)
+                        (progn
+                          (if (= setype "ATTRIB")
+                            (progn
+                              (setq before (mcp-ent-raw-text sub))
+                              (if (mcp-ent-replace-text sub find repl icase dry)
+                                (setq recs (cons (list sub before) recs))
+                              )
+                            )
+                          )
+                          (setq sub (entnext sub))
+                        )
+                      )
+                    )
+                    (if (not dry) (entupd ent))
+                  )
+                )
+                (setq i (1+ i))
+              )
+            )
+          )
+        )
+      )
+
+      (setq recs (reverse recs))
+      (setq total (length recs))
+      (setq returned (if (and limit (> limit 0) (< limit total)) limit total))
+      (setq body "" i 0)
+      (while (< i returned)
+        (setq ent (car (nth i recs)))
+        (setq before (cadr (nth i recs)))
+        ;; in dry mode nothing was written, so show what the edit would produce
+        (setq after (if dry
+                      (if icase (mcp-str-replace-ci before find repl)
+                                (mcp-str-replace before find repl))
+                      (mcp-ent-raw-text ent)))
+        (setq ed (entget ent))
+        (if (> (strlen body) 0) (setq body (strcat body ",")))
+        (setq body (strcat body
+          "{\"handle\":\"" (cdr (assoc 5 ed))
+          "\",\"type\":\"" (cdr (assoc 0 ed))
+          "\",\"layer\":\"" (mcp-escape-string (cdr (assoc 8 ed)))
+          "\",\"before\":\"" (mcp-escape-string before)
+          "\",\"after\":\"" (mcp-escape-string after) "\"}"))
+        (setq i (1+ i))
+      )
+      (cons T (strcat "{\"dry_run\":" (if dry "true" "false")
+                      ",\"count\":" (itoa total)
+                      ",\"returned\":" (itoa returned)
+                      ",\"truncated\":" (if (< returned total) "true" "false")
+                      ",\"entities\":[" body "]}"))
     )
   )
 )

@@ -392,6 +392,82 @@ class EzdxfBackend(AutoCADBackend):
             "entities": hits,
         })
 
+    async def annotation_find_replace(self, find, replace="", layer=None, window=None,
+                                      mode="crossing", limit=None, ignore_case=True,
+                                      include_attribs=True, dry_run=False) -> CommandResult:
+        import re
+        from fnmatch import fnmatchcase as fnmatch
+
+        layer_pats = [p.strip().upper() for p in layer.split(",")] if layer else None
+        rx = re.compile(re.escape(find), re.IGNORECASE if ignore_case else 0)
+        if window:
+            x1, y1, x2, y2 = window
+            wxmin, wxmax = min(x1, x2), max(x1, x2)
+            wymin, wymax = min(y1, y2), max(y1, y2)
+            from ezdxf import bbox
+
+        def _in_window(e):
+            ebox = bbox.extents([e])
+            if not ebox.has_data:
+                return False
+            if mode == "inside":
+                return (ebox.extmin.x >= wxmin and ebox.extmax.x <= wxmax
+                        and ebox.extmin.y >= wymin and ebox.extmax.y <= wymax)
+            return not (ebox.extmax.x < wxmin or ebox.extmin.x > wxmax
+                        or ebox.extmax.y < wymin or ebox.extmin.y > wymax)
+
+        def _raw(e):
+            # MTEXT.text is the full string; ezdxf handles the group 1/3 split
+            return getattr(e, "text", None) if e.dxftype() == "MTEXT" else e.dxf.get("text", None)
+
+        def _set(e, v):
+            if e.dxftype() == "MTEXT":
+                e.text = v
+            else:
+                e.dxf.text = v
+
+        hits = []
+
+        def _try(e, container=None):
+            before = _raw(e)
+            if not before:
+                return
+            after = rx.sub(replace, before)
+            if after == before:
+                return
+            if not dry_run:
+                _set(e, after)
+            item = {"handle": e.dxf.handle, "type": e.dxftype(),
+                    "layer": e.dxf.get("layer", "0"), "before": before, "after": after}
+            hits.append(item)
+
+        for e in self._msp:
+            etp = e.dxftype()
+            if etp not in ("TEXT", "MTEXT", "ATTDEF", "INSERT"):
+                continue
+            elayer = e.dxf.get("layer", "0")
+            if layer_pats and not any(fnmatch(elayer.upper(), p) for p in layer_pats):
+                continue
+            if window and not _in_window(e):
+                continue
+            if etp == "INSERT":
+                if include_attribs:
+                    for att in e.attribs:
+                        _try(att, e)
+                continue
+            _try(e)
+
+        total = len(hits)
+        if limit and limit > 0:
+            hits = hits[:limit]
+        return CommandResult(ok=True, payload={
+            "dry_run": dry_run,
+            "count": total,
+            "returned": len(hits),
+            "truncated": len(hits) < total,
+            "entities": hits,
+        })
+
     async def layer_translate(self, mapping, dry_run=False, purge=True) -> CommandResult:
         from fnmatch import fnmatchcase as fnmatch
 
