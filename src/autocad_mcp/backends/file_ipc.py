@@ -434,6 +434,14 @@ class FileIPCBackend(AutoCADBackend):
             "include_attribs": 1 if include_attribs else 0,
         })
 
+    async def entity_export_geometry(self, layer=None, etype=None, window=None,
+                                     mode="crossing", limit=None) -> CommandResult:
+        window_str = ",".join(str(v) for v in window) if window else None
+        return await self._dispatch("entity-export-geometry", {
+            "layer": layer, "etype": etype,
+            "window_str": window_str, "mode": mode, "limit": limit,
+        })
+
     async def entity_erase(self, entity_id) -> CommandResult:
         return await self._dispatch("entity-erase", {"entity_id": entity_id})
 

@@ -270,6 +270,9 @@
     ((= cmd-name "entity-find-text")
      (mcp-cmd-entity-find-text params-json))
 
+    ((= cmd-name "entity-export-geometry")
+     (mcp-cmd-entity-export-geometry params-json))
+
     ((= cmd-name "entity-erase")
      (mcp-cmd-entity-erase params-json))
 
@@ -1161,6 +1164,91 @@
       (cons T (mcp-recs->result-json (reverse recs) limit))
     )
   )
+)
+
+;; --- Raw geometry export (normalisation happens Python-side) ---
+
+(defun mcp-num (v) (rtos v 2 6))
+
+(defun mcp-deg (a)
+  "DXF angles come back from entget in radians; emit degrees."
+  (rtos (/ (* a 180.0) pi) 2 6)
+)
+
+(defun mcp-verts->json (pts / s p)
+  (setq s "")
+  (foreach p pts
+    (if (> (strlen s) 0) (setq s (strcat s ",")))
+    (setq s (strcat s "[" (mcp-num (car p)) "," (mcp-num (cadr p)) "]"))
+  )
+  (strcat "[" s "]")
+)
+
+(defun mcp-ent->geom-json (ent / ed etype handle elayer s p q r)
+  "Raw geometry for one entity. Only the shapes worth normalising later —
+   anything else reports its type so the caller knows it was skipped."
+  (setq ed (entget ent))
+  (setq etype (cdr (assoc 0 ed)))
+  (setq handle (cdr (assoc 5 ed)))
+  (setq elayer (cdr (assoc 8 ed)))
+  (setq s (strcat "{\"type\":\"" etype
+                  "\",\"handle\":\"" handle
+                  "\",\"layer\":\"" (mcp-escape-string elayer) "\""))
+  (cond
+    ((= etype "LINE")
+     (setq p (cdr (assoc 10 ed)) q (cdr (assoc 11 ed)))
+     (setq s (strcat s ",\"start\":[" (mcp-num (car p)) "," (mcp-num (cadr p)) "]"
+                       ",\"end\":[" (mcp-num (car q)) "," (mcp-num (cadr q)) "]")))
+    ((= etype "LWPOLYLINE")
+     (setq s (strcat s ",\"closed\":"
+                     (if (and (assoc 70 ed) (= 1 (logand 1 (cdr (assoc 70 ed))))) "true" "false")
+                     ",\"verts\":" (mcp-verts->json (mcp-poly-vertices ent)))))
+    ((= etype "CIRCLE")
+     (setq p (cdr (assoc 10 ed)))
+     (setq s (strcat s ",\"center\":[" (mcp-num (car p)) "," (mcp-num (cadr p)) "]"
+                       ",\"radius\":" (mcp-num (cdr (assoc 40 ed))))))
+    ((= etype "ARC")
+     (setq p (cdr (assoc 10 ed)))
+     (setq s (strcat s ",\"center\":[" (mcp-num (car p)) "," (mcp-num (cadr p)) "]"
+                       ",\"radius\":" (mcp-num (cdr (assoc 40 ed)))
+                       ",\"start_angle\":" (mcp-deg (cdr (assoc 50 ed)))
+                       ",\"end_angle\":" (mcp-deg (cdr (assoc 51 ed))))))
+    ((= etype "INSERT")
+     (setq p (cdr (assoc 10 ed)))
+     (setq r (cdr (assoc 50 ed)))
+     (setq s (strcat s ",\"name\":\"" (mcp-escape-string (cdr (assoc 2 ed))) "\""
+                       ",\"insert\":[" (mcp-num (car p)) "," (mcp-num (cadr p)) "]"
+                       ",\"rotation\":" (mcp-deg (if r r 0.0))
+                       ",\"scale\":[" (mcp-num (cdr (assoc 41 ed))) ","
+                                      (mcp-num (cdr (assoc 42 ed))) "]")))
+  )
+  (strcat s "}")
+)
+
+(defun mcp-cmd-entity-export-geometry (params / layer etype window-str mode limit
+                                       ss total returned body i)
+  "Dump raw geometry by layer/type. The rectangle and centreline maths runs
+   Python-side: AutoLISP has no arrays and its strcat is O(n^2), which makes
+   it the wrong place for geometry."
+  (setq layer (mcp-json-get-string params "layer"))
+  (setq etype (mcp-json-get-string params "etype"))
+  (if (or (null etype) (= etype "")) (setq etype "LINE,LWPOLYLINE,CIRCLE,ARC,INSERT"))
+  (setq window-str (mcp-json-get-string params "window_str"))
+  (setq mode (mcp-json-get-string params "mode"))
+  (setq limit (mcp-json-get-limit params))
+  (setq ss (mcp-ssget-scoped etype layer window-str mode))
+  (setq total (if ss (sslength ss) 0))
+  (setq returned (if (and limit (> limit 0) (< limit total)) limit total))
+  (setq body "" i 0)
+  (while (< i returned)
+    (if (> (strlen body) 0) (setq body (strcat body ",")))
+    (setq body (strcat body (mcp-ent->geom-json (ssname ss i))))
+    (setq i (1+ i))
+  )
+  (cons T (strcat "{\"count\":" (itoa total)
+                  ",\"returned\":" (itoa returned)
+                  ",\"truncated\":" (if (< returned total) "true" "false")
+                  ",\"entities\":[" body "]}"))
 )
 
 ;; --- Drawing units / insertion base / UCS ---

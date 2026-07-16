@@ -5,9 +5,12 @@ Tools: drawing, entity, layer, block, annotation, pid, view, system
 
 from __future__ import annotations
 
+import collections
+
 import structlog
 from mcp.server.fastmcp import FastMCP
 
+from autocad_mcp import geometry
 from autocad_mcp.backends.base import CommandResult
 from autocad_mcp.client import (
     _error,
@@ -259,6 +262,29 @@ async def entity(
                           block inserts (ssget cannot select those directly).
                           ATTRIB hits also carry {tag, block}. When filtering by
                           layer/window, an ATTRIB is matched via its INSERT.
+      export_geometry_json — Geometry by layer, optionally normalised into the
+                          shapes a model is built from — check counts and sizes
+                          against the drawing without opening Revit.
+                          data: {layer?, etype?, window?, mode?, limit?,
+                                 normalize?, ...}
+                            normalize "raw" (default) — LINE start/end,
+                              LWPOLYLINE verts+closed, CIRCLE/ARC, INSERT.
+                            normalize "rectangles" — closed 4-vertex polylines
+                              → {center, width, depth, rotation}, for columns.
+                              width is the longer side, rotation is its angle in
+                              [0,180), so the same column compares equal however
+                              it was drawn. Tunable: angle_tol_deg, rel_len_tol.
+                            normalize "centerlines" — parallel LINEs facing each
+                              other → {start, end, width, length, angle}, for
+                              beams/walls. Needs max_width in DRAWING UNITS (see
+                              drawing.get_units_and_base); it is the only thing
+                              telling a beam's two faces from an unrelated
+                              parallel line. Tunable: min_width, angle_tol_deg,
+                              min_overlap.
+                          Both report what they could not convert — skipped /
+                          unpaired, with reasons — so a count that looks short
+                          can be explained rather than trusted blindly.
+                          Normalising refuses to run on a truncated read.
 
     These reads return:
       {count, returned, truncated, entities: [{type, handle, layer, point?, text?}]}
@@ -358,6 +384,14 @@ async def _entity_dispatch(
             data.get("window"), data.get("mode", "crossing"),
             int(data.get("limit", DEFAULT_READ_LIMIT)),
         )
+    elif operation == "export_geometry_json":
+        result = await backend.entity_export_geometry(
+            data.get("layer"), data.get("etype"), data.get("window"),
+            data.get("mode", "crossing"),
+            int(data.get("limit", DEFAULT_READ_LIMIT)),
+        )
+        if result.ok:
+            result = _normalize_geometry(result, data)
     elif operation == "find_text":
         result = await backend.entity_find_text(
             data["pattern"], data.get("layer"),
@@ -391,6 +425,69 @@ async def _entity_dispatch(
         return CommandResult(ok=False, error=f"Unknown entity operation: {operation}")
 
     return result
+
+
+def _normalize_geometry(result: CommandResult, data: dict) -> CommandResult:
+    """Turn a raw geometry dump into the shape asked for by data.normalize."""
+    mode = (data.get("normalize") or "raw").lower()
+    payload = result.payload
+    entities = payload.get("entities", [])
+
+    if mode == "raw":
+        return result
+
+    if payload.get("truncated"):
+        # Normalising a truncated dump would quietly under-report the count,
+        # which is exactly the number this tool exists to be trusted on.
+        return CommandResult(ok=False, error=(
+            f"refusing to normalize a truncated read: {payload['returned']} of "
+            f"{payload['count']} entities. Narrow it with layer/etype/window, "
+            f"or raise limit (0 = no cap)."
+        ))
+
+    if mode == "rectangles":
+        rects, skipped = geometry.rectangles_from_entities(
+            entities,
+            float(data.get("angle_tol_deg", geometry.DEFAULT_ANGLE_TOL_DEG)),
+            float(data.get("rel_len_tol", 0.01)),
+        )
+        return CommandResult(ok=True, payload={
+            "normalize": "rectangles", "read": payload["count"],
+            "count": len(rects), "rectangles": rects,
+            "skipped_count": len(skipped), "skipped": skipped,
+        })
+
+    if mode == "centerlines":
+        if data.get("max_width") is None:
+            return CommandResult(ok=False, error=(
+                "normalize='centerlines' needs data.max_width, in drawing units: "
+                "it is what separates the two faces of a beam from an unrelated "
+                "parallel line, and it depends on units this server cannot guess "
+                "(check drawing.get_units_and_base)."
+            ))
+        try:
+            lines, unpaired, duplicates = geometry.pair_double_lines(
+                entities,
+                float(data["max_width"]),
+                float(data.get("min_width", 0.0)),
+                float(data.get("angle_tol_deg", geometry.DEFAULT_ANGLE_TOL_DEG)),
+                float(data.get("min_overlap", 0.0)),
+            )
+        except ValueError as e:
+            return CommandResult(ok=False, error=str(e))
+        return CommandResult(ok=True, payload={
+            "normalize": "centerlines", "read": payload["count"],
+            "count": len(lines), "centerlines": lines,
+            "width_tally": dict(sorted(collections.Counter(
+                round(c["width"], 3) for c in lines
+            ).items())),
+            "unpaired_count": len(unpaired), "unpaired": unpaired,
+            "duplicate_count": len(duplicates), "duplicates": duplicates,
+        })
+
+    return CommandResult(ok=False, error=(
+        f"unknown normalize '{mode}' — use raw, rectangles or centerlines"
+    ))
 
 
 # Params the entity tool takes at top level. A batch op is a flat dict, so these

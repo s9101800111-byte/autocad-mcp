@@ -611,6 +611,73 @@ class EzdxfBackend(AutoCADBackend):
             "blocks": blocks,
         })
 
+    async def entity_export_geometry(self, layer=None, etype=None, window=None,
+                                     mode="crossing", limit=None) -> CommandResult:
+        from fnmatch import fnmatchcase as fnmatch
+
+        layer_pats = [p.strip().upper() for p in layer.split(",")] if layer else None
+        types = [t.strip().upper() for t in etype.split(",")] if etype else \
+            ["LINE", "LWPOLYLINE", "CIRCLE", "ARC", "INSERT"]
+        if window:
+            x1, y1, x2, y2 = window
+            wxmin, wxmax = min(x1, x2), max(x1, x2)
+            wymin, wymax = min(y1, y2), max(y1, y2)
+            from ezdxf import bbox
+
+        out = []
+        for e in self._msp:
+            etp = e.dxftype()
+            if not any(fnmatch(etp, t) for t in types):
+                continue
+            elayer = e.dxf.get("layer", "0")
+            if layer_pats and not any(fnmatch(elayer.upper(), p) for p in layer_pats):
+                continue
+            if window:
+                ebox = bbox.extents([e])
+                if not ebox.has_data:
+                    continue
+                if mode == "inside":
+                    if not (ebox.extmin.x >= wxmin and ebox.extmax.x <= wxmax
+                            and ebox.extmin.y >= wymin and ebox.extmax.y <= wymax):
+                        continue
+                elif (ebox.extmax.x < wxmin or ebox.extmin.x > wxmax
+                      or ebox.extmax.y < wymin or ebox.extmin.y > wymax):
+                    continue
+
+            item = {"type": etp, "handle": e.dxf.handle, "layer": elayer}
+            try:
+                if etp == "LINE":
+                    item["start"] = [round(v, 6) for v in list(e.dxf.start)[:2]]
+                    item["end"] = [round(v, 6) for v in list(e.dxf.end)[:2]]
+                elif etp == "LWPOLYLINE":
+                    item["closed"] = bool(e.closed)
+                    item["verts"] = [[round(p[0], 6), round(p[1], 6)] for p in e.get_points("xy")]
+                elif etp == "CIRCLE":
+                    item["center"] = [round(v, 6) for v in list(e.dxf.center)[:2]]
+                    item["radius"] = round(e.dxf.radius, 6)
+                elif etp == "ARC":
+                    item["center"] = [round(v, 6) for v in list(e.dxf.center)[:2]]
+                    item["radius"] = round(e.dxf.radius, 6)
+                    item["start_angle"] = round(e.dxf.start_angle, 6)
+                    item["end_angle"] = round(e.dxf.end_angle, 6)
+                elif etp == "INSERT":
+                    item["name"] = e.dxf.get("name", "")
+                    item["insert"] = [round(v, 6) for v in list(e.dxf.insert)[:2]]
+                    item["rotation"] = round(e.dxf.get("rotation", 0.0), 6)
+                    item["scale"] = [round(e.dxf.get("xscale", 1.0), 6),
+                                     round(e.dxf.get("yscale", 1.0), 6)]
+            except Exception as ex:
+                item["error"] = str(ex)
+            out.append(item)
+
+        total = len(out)
+        if limit and limit > 0:
+            out = out[:limit]
+        return CommandResult(ok=True, payload={
+            "count": total, "returned": len(out),
+            "truncated": len(out) < total, "entities": out,
+        })
+
     async def entity_erase(self, entity_id) -> CommandResult:
         try:
             e = self._doc.entitydb.get(entity_id)
