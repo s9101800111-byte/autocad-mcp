@@ -1,6 +1,6 @@
-"""AutoCAD MCP Server v3.1 — 8 consolidated tools with operation dispatch.
+"""AutoCAD MCP Server v3.1 — 9 consolidated tools with operation dispatch.
 
-Tools: drawing, entity, layer, block, annotation, pid, view, system
+Tools: drawing, entity, layer, block, annotation, pid, view, system, space
 """
 
 from __future__ import annotations
@@ -983,6 +983,132 @@ async def system(
         return await add_screenshot_if_available(result, include_screenshot)
     else:
         return _json({"error": f"Unknown system operation: {operation}"})
+
+
+# ==========================================================================
+# 9. space — Drawing analysis (DXF file, no AutoCAD needed)
+# ==========================================================================
+
+
+@mcp.tool(annotations={"title": "AutoCAD Space Analysis", "readOnlyHint": True})
+@_safe("space")
+async def space(
+    operation: str,
+    data: dict | None = None,
+) -> ToolResult:
+    """Work out what a drawing contains from its geometry, not its layer names.
+
+    Reads a DXF file directly, so it needs no running AutoCAD and no IPC.
+    Convert first if you have a DWG open: drawing(operation="save_as_dxf").
+
+    Every operation writes its full result to a JSON file and returns only a
+    summary — a plan can hold tens of thousands of segments and hundreds of
+    centrelines, which belong on disk, not in a reply.
+
+    Operations:
+      profile_layers  — Measure every layer: segment count, total and median
+                        length, orthogonality, parallel-pair rate, and a
+                        role_guess. Run this first on any drawing from
+                        outside; layer names lie, these numbers do not.
+                        data: {dxf, out_dir?, skip?, max_gap?}
+      detect_walls    — Pair facing parallel lines into walls and report the
+                        thicknesses actually used, plus a centreline per
+                        wall. Feed it the layers profile_layers turned up.
+                        data: {dxf, layers?, out_dir?, max_gap?, min_gap?,
+                               min_length?, angle_tol_deg?, min_overlap?}
+      visualize       — Turn a detect_walls result into a LISP file that
+                        draws the centrelines back onto the drawing, one
+                        layer per thickness. Load it with a single
+                        system(operation="execute_lisp") call; the generated
+                        MCPUNDO command removes them again.
+                        data: {result_json, out_path?, layer?, label?}
+
+    Geometry inside blocks is included — an XREF that has been bound leaves
+    the walls in block definitions, where a modelspace-only read finds
+    nothing. Stray inserts far from the plan are excluded from the extent
+    and counted as stray_segments_outside_extent rather than dragged into
+    the bounding box.
+    """
+    import json
+    import os
+
+    from autocad_mcp.analysis import emit, profile, walls
+
+    data = data or {}
+
+    if operation == "visualize":
+        src = data.get("result_json")
+        if not src:
+            return _json({"error": "data.result_json is required "
+                                   "(the detail_json path from detect_walls)"})
+        with open(src, encoding="utf-8") as fh:
+            result = json.load(fh)
+        out_path = data.get("out_path") or os.path.join(
+            os.path.dirname(os.path.abspath(src)), "centerlines.lsp")
+        return _json(emit.centerlines_lisp(
+            result, out_path,
+            layer=data.get("layer", "MCP-WALL-CL"),
+            label=bool(data.get("label", False)),
+        ))
+
+    dxf = data.get("dxf")
+    if not dxf:
+        return _json({"error": "data.dxf is required (path to a .dxf file)"})
+    if not os.path.isfile(dxf):
+        return _json({"error": f"not found: {dxf}. ezdxf reads DXF only — "
+                               "convert a DWG with drawing(operation='save_as_dxf')."})
+
+    out_dir = data.get("out_dir") or os.path.join(
+        os.path.dirname(os.path.abspath(dxf)), "mcp_analysis")
+    stem = os.path.splitext(os.path.basename(dxf))[0]
+
+    if operation == "profile_layers":
+        kw = {}
+        if data.get("skip") is not None:
+            kw["skip"] = tuple(data["skip"])
+        if data.get("max_gap") is not None:
+            kw["max_gap"] = float(data["max_gap"])
+        result = profile.profile_layers(dxf, **kw)
+        detail = _dump(result, out_dir, f"{stem}_layers.json")
+        rows = result.get("layers", [])
+        return _json({
+            **{k: v for k, v in result.items() if k != "layers"},
+            "layers": [
+                {k: r[k] for k in ("layer", "segments", "total_length_m",
+                                   "median_length_m", "orthogonal",
+                                   "parallel_pair_rate", "role_guess")}
+                for r in rows[:40]
+            ],
+            "layers_omitted_from_summary": max(0, len(rows) - 40),
+            "detail_json": detail,
+        })
+
+    if operation == "detect_walls":
+        kw = {k: data[k] for k in ("layers", "max_gap", "min_gap", "min_length",
+                                   "angle_tol_deg", "min_overlap") if k in data}
+        result = walls.detect_walls(dxf, **kw)
+        if "error" in result:
+            return _json(result)
+        detail = _dump(result, out_dir, f"{stem}_walls.json")
+        return _json({
+            **{k: v for k, v in result.items() if k != "centerlines"},
+            "centerlines_written": len(result["centerlines"]),
+            "detail_json": detail,
+        })
+
+    return _json({"error": f"Unknown space operation: {operation}"})
+
+
+def _dump(result: dict, out_dir: str, filename: str) -> str:
+    """Write the full result beside the drawing and return its path."""
+    import json
+    import os
+
+    os.makedirs(out_dir, exist_ok=True)
+    path = os.path.join(out_dir, filename)
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(result, fh, ensure_ascii=False, indent=1, default=str)
+    return path
 
 
 # ==========================================================================
