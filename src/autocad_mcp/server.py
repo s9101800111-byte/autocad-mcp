@@ -586,6 +586,25 @@ async def layer(
         Only entities in the drawing move. Geometry inside block definitions
         keeps its own layer, which is also why a source layer may survive
         purge — a block definition still references it.
+      classify        — Sort layers into fixed roles with TypeSafe Jev:
+                        column beam wall grid grid_tag opening frame title
+                        dimension text hatch other.
+        data: {layers?, with_stats?, refresh?}
+          layers     — names, or [{name, stats: {ENTITY_TYPE: count}}].
+                       Omit to read the open drawing.
+          with_stats — when reading the drawing, send per-layer entity
+                       counts as context (default true).
+          refresh    — ignore the cache and ask again (default false).
+        → {counts, by_role (auto tier only), layers: [{layer, role,
+           role_zh, confidence, tier, source, alternatives?}], usage,
+           cache_path}
+        tier: auto ≥0.8 apply directly; needs_confirm 0.5–0.8 ask the
+        user (alternatives give the runner-up roles for the buttons);
+        unknown <0.5 fall back to the skill's manual step.
+        source: rule (DIMENSION-only / HATCH-only / Defpoints), cache
+        (same normalised name answered before), jev.
+        Sends only layer names and counts — never drawing text. Needs
+        TYPESAFE_API_KEY.
     """
     data = data or {}
     backend = await get_backend()
@@ -613,10 +632,33 @@ async def layer(
         result = await backend.layer_translate(
             mapping, bool(data.get("dry_run", False)), bool(data.get("purge", True))
         )
+    elif operation == "classify":
+        return _json(await _classify_layers(backend, data))
     else:
         return _json({"error": f"Unknown layer operation: {operation}"})
 
     return await add_screenshot_if_available(result, include_screenshot)
+
+
+async def _classify_layers(backend, data: dict) -> dict:
+    from autocad_mcp import layer_classify
+
+    given = data.get("layers")
+    if given:
+        layers = [(x, None) if isinstance(x, str) else (x["name"], x.get("stats")) for x in given]
+    else:
+        listed = await backend.layer_list()
+        if not listed.ok:
+            return {"error": f"layer list failed: {listed.error}"}
+        names = [l["name"] for l in listed.payload["layers"]]
+        stats = {}
+        if data.get("with_stats", True):
+            st = await backend.layer_stats()
+            if st.ok:
+                stats = st.payload["stats"]
+        # a layer missing from stats has no entities: say so rather than send nothing
+        layers = [(n, stats.get(n, {}) if stats else None) for n in names]
+    return await layer_classify.classify(layers, refresh=bool(data.get("refresh", False)))
 
 
 # ==========================================================================

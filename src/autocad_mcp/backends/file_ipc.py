@@ -508,6 +508,17 @@ class FileIPCBackend(AutoCADBackend):
             "purge": 1 if purge else 0,
         })
 
+    async def layer_stats(self) -> CommandResult:
+        result = await self._dispatch("layer-stats", {})
+        if not result.ok:
+            return result
+        stats: dict[str, dict[str, int]] = {}
+        # key is "LAYER|TYPE"; xref layers contain '|' themselves, so split on the last one
+        for key, count in (result.payload or {}).get("stats", []):
+            layer, etype = key.rsplit("|", 1)
+            stats.setdefault(layer, {})[etype] = count
+        return CommandResult(ok=True, payload={"stats": stats})
+
     # --- Block operations ---
 
     async def block_list(self) -> CommandResult:

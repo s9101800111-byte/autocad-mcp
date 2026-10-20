@@ -252,6 +252,10 @@ class AutoCADBackend(ABC):
     ) -> CommandResult:
         return CommandResult(ok=False, error="Not supported on this backend")
 
+    async def layer_stats(self) -> CommandResult:
+        """payload: {stats: {layer: {entity_type: count}}}"""
+        return CommandResult(ok=False, error="Not supported on this backend")
+
     # --- Block operations ---
 
     async def block_list(self) -> CommandResult:

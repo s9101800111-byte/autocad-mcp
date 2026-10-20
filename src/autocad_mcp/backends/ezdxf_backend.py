@@ -834,6 +834,13 @@ class EzdxfBackend(AutoCADBackend):
             })
         return CommandResult(ok=True, payload={"layers": layers})
 
+    async def layer_stats(self) -> CommandResult:
+        stats: dict[str, dict[str, int]] = {}
+        for e in self._msp:
+            per = stats.setdefault(e.dxf.layer, {})
+            per[e.dxftype()] = per.get(e.dxftype(), 0) + 1
+        return CommandResult(ok=True, payload={"stats": stats})
+
     async def layer_create(self, name, color="white", linetype="CONTINUOUS") -> CommandResult:
         if name in self._doc.layers:
             return CommandResult(ok=True, payload={"name": name, "existed": True})

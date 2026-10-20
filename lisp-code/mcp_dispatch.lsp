@@ -220,6 +220,9 @@
     ((= cmd-name "layer-translate")
      (mcp-cmd-layer-translate params-json))
 
+    ((= cmd-name "layer-stats")
+     (mcp-cmd-layer-stats))
+
     ((= cmd-name "layer-unlock")
      (mcp-cmd-layer-unlock params-json))
 
@@ -1579,6 +1582,27 @@
                       ",\"results\":[" results "]}"))
     )
   )
+)
+
+;; --- Layer statistics (context for layer.classify) ---
+
+(defun mcp-cmd-layer-stats ( / ss i ed key pair tally out)
+  "Entity count per (layer, type) over the whole drawing. Only names and
+   counts leave AutoCAD - no text content."
+  (setq ss (ssget "_X") tally nil i 0)
+  (if ss
+    (while (< i (sslength ss))
+      (setq ed (entget (ssname ss i)))
+      (setq key (strcat (cdr (assoc 8 ed)) "|" (cdr (assoc 0 ed))))
+      (if (setq pair (assoc key tally))
+        (setq tally (subst (cons key (1+ (cdr pair))) pair tally))
+        (setq tally (cons (cons key 1) tally)))
+      (setq i (1+ i))))
+  (setq out "")
+  (foreach pair tally
+    (if (> (strlen out) 0) (setq out (strcat out ",")))
+    (setq out (strcat out "[\"" (mcp-escape-string (car pair)) "\"," (itoa (cdr pair)) "]")))
+  (cons T (strcat "{\"stats\":[" out "]}"))
 )
 
 ;; --- Block attribute extraction ---
