@@ -73,32 +73,42 @@ TIMEOUT = IPC_TIMEOUT  # seconds (configurable via AUTOCAD_MCP_IPC_TIMEOUT)
 STALE_THRESHOLD = 60.0  # clean up files older than this
 
 
-def find_autocad_window() -> int | None:
-    """Find the AutoCAD LT window handle by checking window titles."""
+def find_autocad_windows() -> list[tuple[int, str]]:
+    """All AutoCAD drawing windows as (hwnd, title), front-most first."""
     if sys.platform != "win32":
-        return None
+        return []
     try:
         import win32gui
 
-        windows: list[int] = []
+        windows: list[tuple[int, str]] = []
 
         def callback(hwnd, result):
             if win32gui.IsWindowVisible(hwnd):
-                text = win32gui.GetWindowText(hwnd).lower()
+                title = win32gui.GetWindowText(hwnd)
+                text = title.lower()
                 if "autocad" in text and ("drawing" in text or ".dwg" in text):
-                    result.append(hwnd)
+                    result.append((hwnd, title))
             return True
 
         win32gui.EnumWindows(callback, windows)
-        return windows[0] if windows else None
+        return windows
     except ImportError:
-        return None
+        return []
+
+
+def find_autocad_window() -> int | None:
+    """Find the AutoCAD LT window handle by checking window titles."""
+    windows = find_autocad_windows()
+    return windows[0][0] if windows else None
 
 
 class FileIPCBackend(AutoCADBackend):
     """File-based IPC with AutoCAD LT via mcp_dispatch.lsp."""
 
-    def __init__(self):
+    def __init__(self, window: str | None = None):
+        # Title substring choosing among several AutoCAD instances; falls back
+        # to AUTOCAD_MCP_WINDOW, then to whichever window answers the ping.
+        self._window = window or os.environ.get("AUTOCAD_MCP_WINDOW") or None
         self._hwnd: int | None = None
         self._command_hwnd: int | None = None
         self._ipc_dir = Path(IPC_DIR)
@@ -125,10 +135,41 @@ class FileIPCBackend(AutoCADBackend):
         )
 
     async def initialize(self) -> CommandResult:
-        """Find AutoCAD window and verify dispatcher is loaded."""
-        self._hwnd = find_autocad_window()
-        if not self._hwnd:
+        """Find AutoCAD window and verify dispatcher is loaded.
+
+        With several AutoCAD instances open, only windows whose title
+        contains the window hint are considered; each is pinged front to
+        back and the first with the dispatcher loaded wins.
+        """
+        windows = find_autocad_windows()
+        if not windows:
             return CommandResult(ok=False, error="AutoCAD LT window not found")
+        if self._window:
+            hint = self._window.lower()
+            matching = [w for w in windows if hint in w[1].lower()]
+            if not matching:
+                return CommandResult(
+                    ok=False,
+                    error=f"No AutoCAD window title contains {self._window!r}. Open: {[t for _, t in windows]}",
+                )
+            windows = matching
+
+        # Ensure IPC directory exists
+        self._ipc_dir.mkdir(parents=True, exist_ok=True)
+
+        # Clean up stale IPC files
+        self._cleanup_stale_files()
+
+        for hwnd, _title in windows:
+            self._hwnd = hwnd
+            # Find command-line child edit control for focus-free dispatch
+            self._command_hwnd = self._find_command_line_hwnd()
+            log.info("command_line_hwnd", hwnd=self._command_hwnd)
+
+            # Ping the dispatcher to verify it's loaded
+            result = await self._dispatch("ping", {})
+            if result.ok:
+                break
 
         # Set up screenshot provider
         try:
@@ -138,18 +179,6 @@ class FileIPCBackend(AutoCADBackend):
         except Exception:
             pass
 
-        # Find command-line child edit control for focus-free dispatch
-        self._command_hwnd = self._find_command_line_hwnd()
-        log.info("command_line_hwnd", hwnd=self._command_hwnd)
-
-        # Ensure IPC directory exists
-        self._ipc_dir.mkdir(parents=True, exist_ok=True)
-
-        # Clean up stale IPC files
-        self._cleanup_stale_files()
-
-        # Ping the dispatcher to verify it's loaded
-        result = await self._dispatch("ping", {})
         if not result.ok:
             lisp_path = str(LISP_DIR / "mcp_dispatch.lsp").replace("\\", "/")
             return CommandResult(
@@ -167,6 +196,7 @@ class FileIPCBackend(AutoCADBackend):
         info = {
             "backend": "file_ipc",
             "hwnd": self._hwnd,
+            "window": dict(find_autocad_windows()).get(self._hwnd),
             "ipc_dir": str(self._ipc_dir),
             "capabilities": {k: v for k, v in self.capabilities.__dict__.items()},
         }

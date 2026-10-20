@@ -22,6 +22,8 @@ log = structlog.get_logger()
 
 _backend: AutoCADBackend | None = None
 _init_lock = asyncio.Lock()
+# Title substring picking the AutoCAD instance, set by system(operation="init")
+_window_hint: str | None = None
 
 
 async def get_backend() -> AutoCADBackend:
@@ -44,7 +46,7 @@ async def get_backend() -> AutoCADBackend:
         if backend_name == "file_ipc":
             from autocad_mcp.backends.file_ipc import FileIPCBackend
 
-            backend = FileIPCBackend()
+            backend = FileIPCBackend(window=_window_hint)
         else:
             from autocad_mcp.backends.ezdxf_backend import EzdxfBackend
 

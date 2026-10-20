@@ -983,7 +983,12 @@ async def system(
       health        — Quick health check (ping backend).
       get_backend   — Return current backend name and capabilities.
       runtime       — Return process/runtime details for spawn diagnostics.
-      init          — Re-initialize the backend.
+      init          — Re-initialize the backend. data: {window?}
+                      With several AutoCAD instances open, window is a title
+                      substring (e.g. the DWG name) picking one; it sticks for
+                      later re-inits ("" clears it). Without it, the front-most
+                      window with mcp_dispatch.lsp loaded is used. The env var
+                      AUTOCAD_MCP_WINDOW sets a default.
       execute_lisp  — Execute arbitrary AutoLISP code (File IPC only). data: {code}
     """
     data = data or {}
@@ -1017,6 +1022,8 @@ async def system(
         # Force re-initialization
         from autocad_mcp import client
         client._backend = None
+        if data and "window" in data:
+            client._window_hint = data["window"] or None
         backend = await get_backend()
         result = await backend.status()
         return _json(result.to_dict())
