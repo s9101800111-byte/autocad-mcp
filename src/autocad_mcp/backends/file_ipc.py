@@ -49,6 +49,24 @@ def _redecode_cjk(obj, encoding: str = "big5"):
     return obj
 
 
+def _parse_result(raw: bytes):
+    # AutoCAD LISP writes files in Windows-1252 encoding;
+    # try UTF-8 first (covers ASCII), fall back to cp1252
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        text = raw.decode("cp1252")
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        if sys.platform != "win32":
+            raise
+        # Unescaped Big5 text whose trail byte is 0x5C (蓋, 許, 功...) reads as a
+        # stray backslash byte-wise; decoded with the ANSI codepage it is one char.
+        # A partially written file still fails here and is retried by the caller.
+        return json.loads(raw.decode("mbcs", errors="replace"))
+
+
 # IPC settings
 POLL_INTERVAL = 0.1  # seconds
 TIMEOUT = IPC_TIMEOUT  # seconds (configurable via AUTOCAD_MCP_IPC_TIMEOUT)
@@ -204,11 +222,7 @@ class FileIPCBackend(AutoCADBackend):
                     try:
                         # AutoCAD LISP writes files in Windows-1252 encoding;
                         # try UTF-8 first (covers ASCII), fall back to cp1252
-                        try:
-                            text = result_file.read_text(encoding="utf-8")
-                        except UnicodeDecodeError:
-                            text = result_file.read_text(encoding="cp1252")
-                        data = json.loads(text)
+                        data = _parse_result(result_file.read_bytes())
                         data = _redecode_cjk(data)
                         # Verify request_id matches
                         if data.get("request_id") == request_id:
