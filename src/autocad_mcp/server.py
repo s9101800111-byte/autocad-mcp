@@ -604,9 +604,12 @@ async def layer(
         source: rule (DIMENSION-only / HATCH-only / Defpoints), cache
         (same normalised name answered before), jev.
         Sends only layer names and counts — never drawing text. Needs
-        TYPESAFE_API_KEY.
+        TYPESAFE_API_KEY. With data.layers given it needs no running
+        AutoCAD — e.g. names read from a DWG linked in Revit.
     """
     data = data or {}
+    if operation == "classify" and data.get("layers"):
+        return _json(await _classify_layers(None, data))
     backend = await get_backend()
 
     if operation == "list":
