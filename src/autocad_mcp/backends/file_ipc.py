@@ -54,6 +54,16 @@ def _redecode_cjk(obj, encoding: str = "big5"):
     return obj
 
 
+def _withdraw(cmd_file: Path) -> bool:
+    """Delete an unclaimed command file. True only if it was still there to delete,
+    i.e. the dispatcher never read it. Gone or locked (being read) → False."""
+    try:
+        cmd_file.unlink()
+        return True
+    except OSError:
+        return False
+
+
 def _newlines(text: str) -> str:
     # Same translation as Path.read_text: LISP writes CRLF, callers expect "\n"
     return text.replace("\r\n", "\n").replace("\r", "\n")
@@ -275,6 +285,8 @@ class FileIPCBackend(AutoCADBackend):
         tmp_file = cmd_file.with_suffix(".tmp")
 
         completed = False
+        claimed = False
+        cmd_written = False
         pending_file = self._ipc_dir / 'pcad-pending.json'
         try:
             # Strip None values — the simple LISP JSON parser can't handle null
@@ -299,6 +311,7 @@ class FileIPCBackend(AutoCADBackend):
             pending_temp.write_text(json.dumps(payload), encoding="utf-8")
             pending_temp.replace(pending_file)
             tmp_file.rename(cmd_file)
+            cmd_written = True
             # Type the fixed dispatch trigger. Never cancel another in-flight operation.
             self._type_dispatch_trigger()
 
@@ -307,7 +320,6 @@ class FileIPCBackend(AutoCADBackend):
             # dispatcher is not listening and waiting longer is pointless.
             start = time.time()
             deadline = start + (timeout or TIMEOUT)
-            claimed = False
             autoloaded = not AUTOLOAD_DISPATCHER
             while time.time() < deadline:
                 if not claimed and (not cmd_file.exists() or result_file.exists()):
@@ -355,7 +367,13 @@ class FileIPCBackend(AutoCADBackend):
         finally:
             # Uncertain dispatches retain intent, code and late completion evidence.
             # Remove an unclaimed command so a later dispatcher cannot execute it.
-            if completed:
+            # Taking the command file back proves it never ran, so its pending
+            # entry goes too; otherwise a ping sent while AutoCAD was closed
+            # would block every later dispatch until reconciled by hand.
+            never_ran = not completed and not claimed and (
+                not cmd_written or _withdraw(cmd_file)
+            )
+            if completed or never_ran:
                 pending_file.unlink(missing_ok=True)
             for f in ((cmd_file, result_file, tmp_file) if completed else (cmd_file, tmp_file)):
                 try:

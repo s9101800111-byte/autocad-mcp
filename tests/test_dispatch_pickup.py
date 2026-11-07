@@ -82,3 +82,34 @@ async def test_claimed_command_is_never_resent(backend, monkeypatch):
     assert not result.ok
     assert "Timeout" in result.error
     assert posted == []
+
+
+async def test_unclaimed_command_leaves_no_pending_block(backend, monkeypatch):
+    """A command AutoCAD never picked up (e.g. AutoCAD closed) certainly did not run:
+    it must not leave a pending entry that blocks every later dispatch."""
+    monkeypatch.setattr(file_ipc, "AUTOLOAD_DISPATCHER", False)
+    monkeypatch.setattr(backend, "_post_text", lambda text: None)
+
+    first = await backend._dispatch("ping", {}, timeout=10.0)
+    assert not first.ok
+    assert not (backend._ipc_dir / "pcad-pending.json").exists()
+    assert not list(backend._ipc_dir.glob("autocad_mcp_cmd_*.json"))
+
+    # AutoCAD is open now: the next dispatch goes through instead of
+    # IPC_UNCERTAIN_RECONCILE_REQUIRED
+    monkeypatch.setattr(backend, "_type_dispatch_trigger", lambda: _answer_pending(backend._ipc_dir))
+    second = await backend._dispatch("ping", {})
+    assert second.ok and second.payload == "pong"
+
+
+async def test_command_taken_at_the_last_moment_keeps_pending(backend, monkeypatch):
+    """If the dispatcher grabs the file between the last poll and cleanup, the command
+    may have run: keep the pending entry for reconciliation."""
+    monkeypatch.setattr(file_ipc, "AUTOLOAD_DISPATCHER", False)
+    monkeypatch.setattr(backend, "_post_text", lambda text: None)
+    monkeypatch.setattr(file_ipc, "_withdraw", lambda cmd_file: False)
+
+    result = await backend._dispatch("execute-lisp", {}, timeout=10.0)
+
+    assert not result.ok
+    assert (backend._ipc_dir / "pcad-pending.json").exists()
