@@ -5,7 +5,11 @@ Protocol:
 2. Python types the fixed string "(c:mcp-dispatch)" + Enter
 3. LISP reads cmd, dispatches via command map, writes result to
    C:/temp/autocad_mcp_result_{request_id}.json
-4. Python polls for result file (100ms intervals, 10s timeout)
+4. Python polls for result file (100ms intervals, IPC_TIMEOUT seconds)
+
+The dispatcher is loaded per drawing. If a command file is never picked up
+(new drawing tab, dispatcher never loaded), the backend loads
+mcp_dispatch.lsp into the active drawing and retries once.
 """
 
 from __future__ import annotations
@@ -21,7 +25,8 @@ from pathlib import Path
 import structlog
 
 from autocad_mcp.backends.base import AutoCADBackend, BackendCapabilities, CommandResult
-from autocad_mcp.config import IPC_DIR, IPC_TIMEOUT, LISP_DIR
+from autocad_mcp.desktop import ipc_lease, inspect_pending
+from autocad_mcp.config import AUTOLOAD_DISPATCHER, IPC_DIR, IPC_LONG_TIMEOUT, IPC_TIMEOUT, LISP_DIR
 
 log = structlog.get_logger()
 
@@ -49,6 +54,11 @@ def _redecode_cjk(obj, encoding: str = "big5"):
     return obj
 
 
+def _newlines(text: str) -> str:
+    # Same translation as Path.read_text: LISP writes CRLF, callers expect "\n"
+    return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
 def _parse_result(raw: bytes):
     # AutoCAD LISP writes files in Windows-1252 encoding;
     # try UTF-8 first (covers ASCII), fall back to cp1252
@@ -57,20 +67,31 @@ def _parse_result(raw: bytes):
     except UnicodeDecodeError:
         text = raw.decode("cp1252")
     try:
-        return json.loads(text)
+        return json.loads(_newlines(text), strict=False)
     except json.JSONDecodeError:
         if sys.platform != "win32":
             raise
         # Unescaped Big5 text whose trail byte is 0x5C (蓋, 許, 功...) reads as a
         # stray backslash byte-wise; decoded with the ANSI codepage it is one char.
         # A partially written file still fails here and is retried by the caller.
-        return json.loads(raw.decode("mbcs", errors="replace"))
+        return json.loads(_newlines(raw.decode("mbcs", errors="replace")), strict=False)
 
 
 # IPC settings
 POLL_INTERVAL = 0.1  # seconds
 TIMEOUT = IPC_TIMEOUT  # seconds (configurable via AUTOCAD_MCP_IPC_TIMEOUT)
+LONG_TIMEOUT = IPC_LONG_TIMEOUT  # execute_lisp / plot (AUTOCAD_MCP_IPC_LONG_TIMEOUT)
+PICKUP_TIMEOUT = 3.0  # seconds for the dispatcher to claim a command file
+PING_ATTEMPTS = 3
 STALE_THRESHOLD = 60.0  # clean up files older than this
+
+NOT_RESPONDING_HINT = (
+    "AutoCAD did not pick up the command. Likely causes:\n"
+    "  - a dialog box is open in AutoCAD (close it);\n"
+    "  - the active drawing tab does not have mcp_dispatch.lsp loaded "
+    "(it loads per drawing; add it to APPLOAD > Startup Suite to load in every drawing);\n"
+    "  - AutoCAD is busy (regenerating, plotting) or minimized to the tray."
+)
 
 
 def find_autocad_windows() -> list[tuple[int, str]]:
@@ -166,8 +187,18 @@ class FileIPCBackend(AutoCADBackend):
             self._command_hwnd = self._find_command_line_hwnd()
             log.info("command_line_hwnd", hwnd=self._command_hwnd)
 
-            # Ping the dispatcher to verify it's loaded
-            result = await self._dispatch("ping", {})
+            # Ping the dispatcher to verify it's loaded. A single miss is common
+            # (AutoCAD busy for a moment), so retry before giving up; _dispatch
+            # itself loads the dispatcher when the command file is never claimed.
+            result = CommandResult(ok=False, error="not attempted")
+            for attempt in range(PING_ATTEMPTS):
+                result = await self._dispatch("ping", {}, timeout=5.0)
+                if result.ok:
+                    break
+                if result.error in ("IPC_UNCERTAIN_RECONCILE_REQUIRED", "DESKTOP_BUSY_OTHER_CLIENT"):
+                    return result
+                log.info("ping_retry", attempt=attempt + 1, error=result.error)
+                await asyncio.sleep(0.5)
             if result.ok:
                 break
 
@@ -180,17 +211,23 @@ class FileIPCBackend(AutoCADBackend):
             pass
 
         if not result.ok:
-            lisp_path = str(LISP_DIR / "mcp_dispatch.lsp").replace("\\", "/")
             return CommandResult(
                 ok=False,
                 error=(
-                    "AutoCAD LT detected but mcp_dispatch.lsp not loaded.\n"
-                    f'In AutoCAD command line, type:\n  (load "{lisp_path}")\n'
-                    "Or add lisp-code/ to trusted paths for auto-loading."
+                    "AutoCAD LT window found, but mcp_dispatch.lsp is not answering.\n"
+                    f"{NOT_RESPONDING_HINT}\n"
+                    f'To load it by hand, type in the AutoCAD command line:\n  (load "{self._lisp_path}")'
                 ),
             )
 
-        return CommandResult(ok=True, payload={"backend": "file_ipc", "hwnd": self._hwnd})
+        payload = {"backend": "file_ipc", "hwnd": self._hwnd}
+        if isinstance(result.payload, dict):
+            payload.update({k: result.payload.get(k) for k in ("version", "drawing")})
+        return CommandResult(ok=True, payload=payload)
+
+    @property
+    def _lisp_path(self) -> str:
+        return str(LISP_DIR / "mcp_dispatch.lsp").replace("\\", "/")
 
     async def status(self) -> CommandResult:
         info = {
@@ -204,23 +241,41 @@ class FileIPCBackend(AutoCADBackend):
 
     # --- IPC dispatch ---
 
-    async def _dispatch(self, command: str, params: dict, send_esc: bool = True) -> CommandResult:
+    async def _dispatch(self, command: str, params: dict, timeout: float | None = None) -> CommandResult:
         """Send a command via file IPC and wait for result.
 
-        send_esc=False skips the 2x ESC prefix. Needed for reads of the
-        implied/grip selection (get_selection): the ESC would clear the very
-        pickfirst set the command is meant to read.
+        If the command file is not claimed (dispatcher missing in the active
+        drawing), mcp_dispatch.lsp is loaded there and asked to run that same
+        command file, so nothing is ever sent twice.
         """
         async with self._lock:
-            return await self._dispatch_unlocked(command, params, send_esc)
+            try:
+                with ipc_lease(self._ipc_dir):
+                    pending = inspect_pending(self._ipc_dir)
+                    if pending['pending']:
+                        return CommandResult(ok=False, error="IPC_UNCERTAIN_RECONCILE_REQUIRED", payload=pending)
+                    result, claimed = await self._dispatch_unlocked(command, params, timeout)
+                    if not result.ok and not claimed:
+                        result = CommandResult(ok=False, error=f"{result.error}\n{NOT_RESPONDING_HINT}")
+                    return result
+            except RuntimeError as exc:
+                return CommandResult(ok=False, error=str(exc))
 
-    async def _dispatch_unlocked(self, command: str, params: dict, send_esc: bool = True) -> CommandResult:
-        """Core IPC logic (must be called under _lock)."""
+    async def _dispatch_unlocked(
+        self, command: str, params: dict, timeout: float | None = None
+    ) -> tuple[CommandResult, bool]:
+        """Core IPC logic (must be called under _lock).
+
+        Returns (result, claimed): claimed is False when the dispatcher never
+        picked up the command file, i.e. the command certainly did not run.
+        """
         request_id = uuid.uuid4().hex[:12]
         cmd_file = self._ipc_dir / f"autocad_mcp_cmd_{request_id}.json"
         result_file = self._ipc_dir / f"autocad_mcp_result_{request_id}.json"
         tmp_file = cmd_file.with_suffix(".tmp")
 
+        completed = False
+        pending_file = self._ipc_dir / 'pcad-pending.json'
         try:
             # Strip None values — the simple LISP JSON parser can't handle null
             clean_params = {k: v for k, v in params.items() if v is not None}
@@ -240,14 +295,36 @@ class FileIPCBackend(AutoCADBackend):
                 encoding=req_encoding,
                 errors="replace",
             )
+            pending_temp = pending_file.with_suffix('.tmp')
+            pending_temp.write_text(json.dumps(payload), encoding="utf-8")
+            pending_temp.replace(pending_file)
             tmp_file.rename(cmd_file)
+            # Type the fixed dispatch trigger. Never cancel another in-flight operation.
+            self._type_dispatch_trigger()
 
-            # Type the fixed dispatch trigger
-            self._type_dispatch_trigger(send_esc)
-
-            # Poll for result
-            deadline = time.time() + TIMEOUT
+            # Poll for result. The dispatcher deletes the command file as soon as
+            # it reads it; if the file is still there after PICKUP_TIMEOUT, the
+            # dispatcher is not listening and waiting longer is pointless.
+            start = time.time()
+            deadline = start + (timeout or TIMEOUT)
+            claimed = False
+            autoloaded = not AUTOLOAD_DISPATCHER
             while time.time() < deadline:
+                if not claimed and (not cmd_file.exists() or result_file.exists()):
+                    claimed = True
+                if not claimed and time.time() - start > PICKUP_TIMEOUT and not autoloaded:
+                    # Load the dispatcher and run this very command file in one go
+                    # (no ESC in between, which would abort the load).
+                    log.info("dispatcher_autoload", command=command)
+                    self._post_text(f'(progn (load "{self._lisp_path}") (c:mcp-dispatch))')
+                    autoloaded = True
+                    start = time.time()
+                    deadline = start + (timeout or TIMEOUT)
+                    continue
+                if not claimed and time.time() - start > PICKUP_TIMEOUT:
+                    return CommandResult(
+                        ok=False, error=f"Command not picked up by AutoCAD (request_id={request_id})"
+                    ), False
                 if result_file.exists():
                     try:
                         # AutoCAD LISP writes files in Windows-1252 encoding;
@@ -256,20 +333,31 @@ class FileIPCBackend(AutoCADBackend):
                         data = _redecode_cjk(data)
                         # Verify request_id matches
                         if data.get("request_id") == request_id:
+                            completed = True
+                            archive = self._ipc_dir / 'pcad-receipts'
+                            archive.mkdir(exist_ok=True)
+                            (archive / f'{request_id}.json').write_text(json.dumps(data), encoding="utf-8")
                             return CommandResult(
                                 ok=data.get("ok", False),
                                 payload=data.get("payload"),
                                 error=data.get("error"),
-                            )
+                            ), True
                     except (json.JSONDecodeError, OSError):
                         pass  # File may be partially written, retry
                 await asyncio.sleep(POLL_INTERVAL)
 
-            return CommandResult(ok=False, error=f"Timeout waiting for result (request_id={request_id})")
+            return CommandResult(
+                ok=False,
+                error=f"Timeout waiting for result after {timeout or TIMEOUT:.0f}s (request_id={request_id}); "
+                "the command may still be running in AutoCAD",
+            ), claimed
 
         finally:
-            # Cleanup
-            for f in (cmd_file, result_file, tmp_file):
+            # Uncertain dispatches retain intent, code and late completion evidence.
+            # Remove an unclaimed command so a later dispatcher cannot execute it.
+            if completed:
+                pending_file.unlink(missing_ok=True)
+            for f in ((cmd_file, result_file, tmp_file) if completed else (cmd_file, tmp_file)):
                 try:
                     f.unlink(missing_ok=True)
                 except OSError:
@@ -295,49 +383,29 @@ class FileIPCBackend(AutoCADBackend):
         except Exception:
             return None
 
-    def _type_dispatch_trigger(self, send_esc: bool = True):
-        """Post '(c:mcp-dispatch)' + Enter via WM_CHAR to MDIClient — no focus steal.
+    def _type_dispatch_trigger(self):
+        """Dispatch without ESC: a busy command line must be inspected, never cancelled implicitly."""
+        self._post_text("(c:mcp-dispatch)")
 
-        Sends ESC keystrokes first to cancel any stale pending command
-        (e.g. from a previous timeout leaving AutoCAD in a command prompt).
-        send_esc=False skips this — required when reading the grip/pickfirst
-        selection, which ESC would clear.
-        """
+    def _post_text(self, text: str):
+        """Type TEXT + Enter into AutoCAD's command line via WM_CHAR (no focus steal)."""
         try:
             import ctypes
 
             WM_CHAR = 0x0102
-            WM_KEYDOWN = 0x0100
-            WM_KEYUP = 0x0101
-            VK_ESCAPE = 0x1B
             target = self._command_hwnd or self._hwnd
             post = ctypes.windll.user32.PostMessageW
-
-            # Cancel any pending command (2x ESC for nested commands)
-            if send_esc:
-                for _ in range(2):
-                    post(target, WM_KEYDOWN, VK_ESCAPE, 0)
-                    post(target, WM_KEYUP, VK_ESCAPE, 0)
-                time.sleep(0.05)
-
-            for ch in "(c:mcp-dispatch)":
+            for ch in text:
                 post(target, WM_CHAR, ord(ch), 0)
             # Enter = carriage return
             post(target, WM_CHAR, 0x0D, 0)
             time.sleep(0.05)
         except Exception as e:
-            log.error("dispatch_trigger_failed", error=str(e))
+            log.error("post_text_failed", error=str(e))
 
     def _cleanup_stale_files(self):
-        """Remove stale IPC files from previous sessions."""
-        try:
-            now = time.time()
-            for pattern in ("autocad_mcp_*.json", "autocad_mcp_*.tmp", "autocad_mcp_lisp_*.lsp"):
-                for f in self._ipc_dir.glob(pattern):
-                    if now - f.stat().st_mtime > STALE_THRESHOLD:
-                        f.unlink(missing_ok=True)
-        except OSError:
-            pass
+        """Retain IPC evidence; elapsed age never proves a native command completed."""
+        return
 
     # --- Drawing management ---
 
@@ -357,7 +425,7 @@ class FileIPCBackend(AutoCADBackend):
         return await self._dispatch("drawing-purge", {})
 
     async def drawing_plot_pdf(self, path: str) -> CommandResult:
-        return await self._dispatch("drawing-plot-pdf", {"path": path})
+        return await self._dispatch("drawing-plot-pdf", {"path": path}, timeout=LONG_TIMEOUT)
 
     async def drawing_get_variables(self, names: list[str] | None = None) -> CommandResult:
         if names:
@@ -415,7 +483,7 @@ class FileIPCBackend(AutoCADBackend):
         code_file.write_text(code, encoding="utf-8")
         return await self._dispatch("execute-lisp", {
             "code_file": str(code_file).replace("\\", "/")
-        })
+        }, timeout=LONG_TIMEOUT)
 
     # --- Entity operations ---
 
@@ -443,8 +511,8 @@ class FileIPCBackend(AutoCADBackend):
     async def create_mtext(self, x, y, width, text, height=2.5, layer=None) -> CommandResult:
         return await self._dispatch("create-mtext", {"x": x, "y": y, "width": width, "text": text, "height": height, "layer": layer})
 
-    async def create_hatch(self, entity_id, pattern="ANSI31") -> CommandResult:
-        return await self._dispatch("create-hatch", {"entity_id": entity_id, "pattern": pattern})
+    async def create_hatch(self, entity_id, pattern="ANSI31", scale=1.0, angle=0.0) -> CommandResult:
+        return await self._dispatch("create-hatch", {"entity_id": entity_id, "pattern": pattern, "scale": scale, "angle": angle})
 
     async def entity_list(self, layer=None) -> CommandResult:
         return await self._dispatch("entity-list", {"layer": layer})
@@ -457,7 +525,7 @@ class FileIPCBackend(AutoCADBackend):
 
     async def entity_get_selection(self, limit=None) -> CommandResult:
         # No ESC prefix — it would clear the grip selection we want to read.
-        return await self._dispatch("entity-get-selection", {"limit": limit}, send_esc=False)
+        return await self._dispatch("entity-get-selection", {"limit": limit})
 
     async def entity_query(self, layer=None, etype=None, text=None, window=None, mode="crossing", limit=None) -> CommandResult:
         # window passed as "x1,y1,x2,y2" string (LISP JSON parser reads scalars only)
@@ -671,6 +739,18 @@ class FileIPCBackend(AutoCADBackend):
         return await self._dispatch("zoom-window", {"x1": x1, "y1": y1, "x2": x2, "y2": y2})
 
     async def get_screenshot(self) -> CommandResult:
+        if self._hwnd and sys.platform == "win32":
+            try:
+                import win32gui
+
+                # PrintWindow on a minimized window returns an all-black image
+                if win32gui.IsIconic(self._hwnd):
+                    return CommandResult(
+                        ok=False,
+                        error="AutoCAD window is minimized; restore it to capture a screenshot",
+                    )
+            except ImportError:
+                pass
         if self._screenshot_provider:
             data = self._screenshot_provider.capture()
             if data:

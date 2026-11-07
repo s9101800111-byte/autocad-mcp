@@ -10,10 +10,9 @@ import collections
 import structlog
 from mcp.server.fastmcp import FastMCP
 
-from autocad_mcp import geometry
+from autocad_mcp import __version__, geometry
 from autocad_mcp.backends.base import CommandResult
 from autocad_mcp.client import (
-    _error,
     _json,
     _safe,
     add_screenshot_if_available,
@@ -118,7 +117,7 @@ mcp = FastMCP("autocad-mcp")
 # ==========================================================================
 
 
-@mcp.tool(annotations={"title": "AutoCAD Drawing Operations", "readOnlyHint": False})
+@mcp.tool(annotations={"title": "AutoCAD Drawing Operations", "readOnlyHint": False}, structured_output=False)
 @_safe("drawing")
 async def drawing(
     operation: str,
@@ -213,7 +212,7 @@ async def drawing(
 # ==========================================================================
 
 
-@mcp.tool(annotations={"title": "AutoCAD Entity Operations", "readOnlyHint": False})
+@mcp.tool(annotations={"title": "AutoCAD Entity Operations", "readOnlyHint": False}, structured_output=False)
 @_safe("entity")
 async def entity(
     operation: str,
@@ -237,7 +236,7 @@ async def entity(
       create_arc        — data: {cx, cy, radius, start_angle, end_angle}, layer?
       create_ellipse    — data: {cx, cy, major_x, major_y, ratio}, layer?
       create_mtext      — data: {x, y, width, text, height?}, layer?
-      create_hatch      — entity_id, data: {pattern?}
+      create_hatch      — entity_id, data: {pattern?, scale?, angle?}  (pattern SOLID for a fill)
 
     Read operations:
       list              — layer? → list entities
@@ -368,7 +367,7 @@ async def _entity_dispatch(
     elif operation == "create_mtext":
         result = await backend.create_mtext(data["x"], data["y"], data["width"], data["text"], data.get("height", 2.5), layer)
     elif operation == "create_hatch":
-        result = await backend.create_hatch(entity_id, data.get("pattern", "ANSI31"))
+        result = await backend.create_hatch(entity_id, data.get("pattern", "ANSI31"), data.get("scale", 1.0), data.get("angle", 0.0))
     # --- Read ---
     elif operation == "list":
         result = await backend.entity_list(layer)
@@ -555,7 +554,7 @@ async def _entity_batch(backend, ops: list, stop_on_error: bool = True) -> Comma
 # ==========================================================================
 
 
-@mcp.tool(annotations={"title": "AutoCAD Layer Operations", "readOnlyHint": False})
+@mcp.tool(annotations={"title": "AutoCAD Layer Operations", "readOnlyHint": False}, structured_output=False)
 @_safe("layer")
 async def layer(
     operation: str,
@@ -669,7 +668,7 @@ async def _classify_layers(backend, data: dict) -> dict:
 # ==========================================================================
 
 
-@mcp.tool(annotations={"title": "AutoCAD Block Operations", "readOnlyHint": False})
+@mcp.tool(annotations={"title": "AutoCAD Block Operations", "readOnlyHint": False}, structured_output=False)
 @_safe("block")
 async def block(
     operation: str,
@@ -774,7 +773,7 @@ def _write_attributes_csv(path: str, blocks: list, overwrite: bool = False) -> d
 # ==========================================================================
 
 
-@mcp.tool(annotations={"title": "AutoCAD Annotation Operations", "readOnlyHint": False})
+@mcp.tool(annotations={"title": "AutoCAD Annotation Operations", "readOnlyHint": False}, structured_output=False)
 @_safe("annotation")
 async def annotation(
     operation: str,
@@ -850,7 +849,7 @@ async def annotation(
 # ==========================================================================
 
 
-@mcp.tool(annotations={"title": "P&ID Operations (CTO Library)", "readOnlyHint": False})
+@mcp.tool(annotations={"title": "P&ID Operations (CTO Library)", "readOnlyHint": False}, structured_output=False)
 @_safe("pid")
 async def pid(
     operation: str,
@@ -926,7 +925,7 @@ async def pid(
 # ==========================================================================
 
 
-@mcp.tool(annotations={"title": "AutoCAD View Operations", "readOnlyHint": True})
+@mcp.tool(annotations={"title": "AutoCAD View Operations", "readOnlyHint": True}, structured_output=False)
 @_safe("view")
 async def view(
     operation: str,
@@ -934,12 +933,13 @@ async def view(
     y1: float | None = None,
     x2: float | None = None,
     y2: float | None = None,
+    data: dict | None = None,
 ) -> ToolResult:
     """Viewport control and screenshot capture.
 
     Operations:
       zoom_extents   — Zoom to show all entities.
-      zoom_window    — Zoom to window: x1, y1, x2, y2
+      zoom_window    — Zoom to window: x1, y1, x2, y2 (top-level or inside data)
       get_screenshot — Capture current view as PNG image.
     """
     backend = await get_backend()
@@ -948,6 +948,12 @@ async def view(
         result = await backend.zoom_extents()
         return _json(result.to_dict())
     elif operation == "zoom_window":
+        # Other tools take their arguments in `data`; accept that shape here too
+        d = data or {}
+        x1, y1, x2, y2 = (v if v is not None else d.get(k) for k, v in
+                          (("x1", x1), ("y1", y1), ("x2", x2), ("y2", y2)))
+        if None in (x1, y1, x2, y2):
+            return _json({"ok": False, "error": "zoom_window needs x1, y1, x2, y2"})
         result = await backend.zoom_window(x1, y1, x2, y2)
         return _json(result.to_dict())
     elif operation == "get_screenshot":
@@ -969,7 +975,7 @@ async def view(
 # ==========================================================================
 
 
-@mcp.tool(annotations={"title": "AutoCAD MCP System", "readOnlyHint": True})
+@mcp.tool(annotations={"title": "AutoCAD MCP System", "readOnlyHint": True}, structured_output=False)
 @_safe("system")
 async def system(
     operation: str,
@@ -989,6 +995,9 @@ async def system(
                       later re-inits ("" clears it). Without it, the front-most
                       window with mcp_dispatch.lsp loaded is used. The env var
                       AUTOCAD_MCP_WINDOW sets a default.
+      revision      — Journaled native batch/read/export_page/frames/plot/save. data: {action, drawing, ...}
+      desktop       — Read Windows window/dialog state and pending IPC receipt.
+      acknowledge   — Acknowledge reconciled late completion. data: {request_id}
       execute_lisp  — Execute arbitrary AutoLISP code (File IPC only). data: {code}
     """
     data = data or {}
@@ -1027,6 +1036,23 @@ async def system(
         backend = await get_backend()
         result = await backend.status()
         return _json(result.to_dict())
+    elif operation == "revision":
+        from autocad_mcp.revision import execute
+        backend = await get_backend()
+        result = await execute(backend, data.pop("action"), data)
+        return await add_screenshot_if_available(result, include_screenshot)
+    elif operation == "desktop":
+        from autocad_mcp.desktop import observe, inspect_pending
+        backend = await get_backend()
+        if backend.name != "file_ipc":
+            return _json({"ok": False, "error": "NATIVE_BACKEND_REQUIRED"})
+        return _json({"desktop": observe(backend._hwnd), "ipc": inspect_pending(backend._ipc_dir)})
+    elif operation == "acknowledge":
+        from autocad_mcp.desktop import acknowledge
+        backend = await get_backend()
+        if backend.name != "file_ipc":
+            return _json({"ok": False, "error": "NATIVE_BACKEND_REQUIRED"})
+        return _json(acknowledge(backend._ipc_dir, data["request_id"]))
     elif operation == "execute_lisp":
         backend = await get_backend()
         if not data.get("code"):
@@ -1042,7 +1068,7 @@ async def system(
 # ==========================================================================
 
 
-@mcp.tool(annotations={"title": "AutoCAD Space Analysis", "readOnlyHint": True})
+@mcp.tool(annotations={"title": "AutoCAD Space Analysis", "readOnlyHint": True}, structured_output=False)
 @_safe("space")
 async def space(
     operation: str,
@@ -1190,5 +1216,5 @@ def main():
         ],
     )
 
-    log.info("autocad_mcp_starting", version="3.1.0")
+    log.info("autocad_mcp_starting", version=__version__)
     mcp.run(transport="stdio")

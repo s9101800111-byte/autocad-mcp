@@ -3,9 +3,6 @@
 from __future__ import annotations
 
 import math
-import os
-from pathlib import Path
-from typing import Any
 
 import ezdxf
 import structlog
@@ -75,7 +72,7 @@ class EzdxfBackend(AutoCADBackend):
     async def drawing_info(self) -> CommandResult:
         if not self._doc:
             return CommandResult(ok=False, error="No document open")
-        layers = [l.dxf.name for l in self._doc.layers]
+        layers = [layer.dxf.name for layer in self._doc.layers]
         entity_count = len(self._msp)
         blocks = [b.name for b in self._doc.blocks if not b.name.startswith("*")]
         return CommandResult(ok=True, payload={
@@ -804,13 +801,16 @@ class EzdxfBackend(AutoCADBackend):
     async def entity_chamfer(self, entity_id1, entity_id2, dist1, dist2) -> CommandResult:
         return CommandResult(ok=False, error="Chamfer not supported on ezdxf backend")
 
-    async def create_hatch(self, entity_id, pattern="ANSI31") -> CommandResult:
+    async def create_hatch(self, entity_id, pattern="ANSI31", scale=1.0, angle=0.0) -> CommandResult:
         try:
             e = self._doc.entitydb.get(entity_id)
             if e is None:
                 return CommandResult(ok=False, error=f"Entity {entity_id} not found")
             hatch = self._msp.add_hatch()
-            hatch.set_pattern_fill(pattern, scale=1.0)
+            if pattern.upper() == "SOLID":
+                hatch.set_solid_fill()
+            else:
+                hatch.set_pattern_fill(pattern, scale=scale, angle=angle)
             # Try to use the entity as a boundary path
             hatch.paths.add_polyline_path(
                 [(p[0], p[1]) for p in e.get_points(format="xy")],
@@ -824,13 +824,13 @@ class EzdxfBackend(AutoCADBackend):
 
     async def layer_list(self) -> CommandResult:
         layers = []
-        for l in self._doc.layers:
+        for layer in self._doc.layers:
             layers.append({
-                "name": l.dxf.name,
-                "color": l.dxf.get("color", 7),
-                "linetype": l.dxf.get("linetype", "Continuous"),
-                "is_frozen": l.is_frozen(),
-                "is_locked": l.is_locked(),
+                "name": layer.dxf.name,
+                "color": layer.dxf.get("color", 7),
+                "linetype": layer.dxf.get("linetype", "Continuous"),
+                "is_frozen": layer.is_frozen(),
+                "is_locked": layer.is_locked(),
             })
         return CommandResult(ok=True, payload={"layers": layers})
 
@@ -911,7 +911,6 @@ class EzdxfBackend(AutoCADBackend):
     async def block_insert_with_attributes(self, name, x, y, scale=1.0, rotation=0.0, attributes=None) -> CommandResult:
         if name not in self._doc.blocks:
             return CommandResult(ok=False, error=f"Block '{name}' not defined")
-        block = self._doc.blocks[name]
         e = self._msp.add_blockref(name, (x, y), dxfattribs={
             "xscale": scale, "yscale": scale, "zscale": scale,
             "rotation": rotation,
@@ -990,10 +989,19 @@ class EzdxfBackend(AutoCADBackend):
 
     async def create_dimension_linear(self, x1, y1, x2, y2, dim_x, dim_y) -> CommandResult:
         try:
+            # Like DIMLINEAR: a dim line beside the points (outside their x-span, inside their
+            # y-span) is vertical, above/below is horizontal; otherwise follow the longer extent.
+            beside = not min(x1, x2) <= dim_x <= max(x1, x2)
+            within = min(y1, y2) <= dim_y <= max(y1, y2)
+            if beside == within:
+                vertical = beside
+            else:
+                vertical = abs(y2 - y1) > abs(x2 - x1)
             dim = self._msp.add_linear_dim(
                 base=(dim_x, dim_y),
                 p1=(x1, y1),
                 p2=(x2, y2),
+                angle=90 if vertical else 0,
             )
             dim.render()
             return CommandResult(ok=True, payload={"entity_type": "DIMENSION"})
@@ -1017,7 +1025,6 @@ class EzdxfBackend(AutoCADBackend):
             # Calculate angle arc midpoint for dimension location
             a1 = math.atan2(y1 - cy, x1 - cx)
             a2 = math.atan2(y2 - cy, x2 - cx)
-            amid = (a1 + a2) / 2
             r = max(math.hypot(x1 - cx, y1 - cy), math.hypot(x2 - cx, y2 - cy)) * 0.7
             dim = self._msp.add_angular_dim_cra(
                 center=(cx, cy),
@@ -1048,7 +1055,7 @@ class EzdxfBackend(AutoCADBackend):
     async def create_leader(self, points, text) -> CommandResult:
         try:
             pts = [(p[0], p[1]) for p in points]
-            leader = self._msp.add_leader(pts)
+            self._msp.add_leader(pts)
             # Add text at the last point
             last = pts[-1]
             self._msp.add_mtext(text, dxfattribs={
@@ -1079,7 +1086,7 @@ class EzdxfBackend(AutoCADBackend):
 
     async def pid_list_symbols(self, category) -> CommandResult:
         """List CTO symbols from disk or built-in catalog."""
-        from autocad_mcp.pid.cto_library import CTO_ROOT, list_symbols
+        from autocad_mcp.pid.cto_library import list_symbols
         symbols = list_symbols(category)
         return CommandResult(ok=True, payload={"category": category, "symbols": symbols, "count": len(symbols)})
 

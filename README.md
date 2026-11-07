@@ -51,7 +51,7 @@ Add to your MCP client configuration (e.g. Claude Desktop `claude_desktop_config
     "autocad-mcp": {
       "command": "C:\\path\\to\\autocad-mcp\\.venv\\Scripts\\python.exe",
       "args": ["-m", "autocad_mcp"],
-      "env": { "AUTOCAD_MCP_BACKEND": "auto" }
+      "env": { "AUTOCAD_MCP_BACKEND": "file_ipc" }
     }
   }
 }
@@ -72,8 +72,7 @@ If your MCP client runs in WSL (e.g. Claude Code), launch the server through `cm
     "autocad-mcp": {
       "type": "stdio",
       "command": "cmd.exe",
-      "args": ["/d", "/s", "/c", "cd /d C:\\path\\to\\autocad-mcp && .venv\\Scripts\\python.exe -m autocad_mcp"],
-      "env": { "AUTOCAD_MCP_BACKEND": "auto" }
+      "args": ["/d", "/s", "/c", "cd /d C:\\path\\to\\autocad-mcp && set AUTOCAD_MCP_BACKEND=file_ipc&& .venv\\Scripts\\python.exe -m autocad_mcp"]
     }
   }
 }
@@ -88,6 +87,139 @@ system(operation="status")
 ```
 
 You should see `backend: "file_ipc"` if AutoCAD is running, or `backend: "ezdxf"` for headless mode.
+
+For native DWG work, require `file_ipc`; the examples above disable headless fallback.
+Verify `DWGNAME`, `DWGPREFIX`, `CTAB` and `DBMOD` with `drawing.get_variables`, then
+inspect a screenshot before editing. `status` alone does not identify the active DWG.
+Use a Windows-local working copy if Windows cannot access a WSL UNC path, and copy
+saved deliverables back explicitly. Never use `drawing.create` to make a working copy:
+it erases and purges the active drawing.
+
+## Journaled native revisions
+
+`system(operation="revision", data={"action": "read", "drawing": "C:/work/copy.dwg",
+"handles": ["ABCD"]})` reads native entities. The revision adapter supports bounded
+exports, layout frames, guarded edits, plotting and AutoCAD 2010 saves. Each mutation
+batch has 1–7 operations, a unique journal path, expected document identity and old
+entity values. Receipts retain before/after state and created handles. Read the
+[operation reference and recovery procedure](docs-revision.md) before use.
+
+Revision clouds can follow an orthogonal route instead of enclosing unrelated labels:
+
+```json
+{
+  "action": "batch",
+  "drawing": "C:/work/copy.dwg",
+  "id": "route-cloud-01",
+  "journal": "C:/work/route-cloud-01.json",
+  "operations": [{
+    "kind": "cloud", "item": "approved-change-42",
+    "space": "Model", "layer": "REV-01",
+    "points": [[0,0], [8,0], [8,2], [2,2], [2,8], [0,8]],
+    "arc": 0.4, "text_height": 0.3, "revision": "01",
+    "marker_position": [10,3]
+  }]
+}
+```
+
+Create the revision layer first. Pass this object to `system` with `operation="revision"`.
+For the Windows CLI, save the object as `request.json` (the extra `action` is ignored):
+
+```powershell
+python -m autocad_mcp.revision batch request.json --output receipt.json
+```
+
+An existing MCP session can use the updated helper through `execute_lisp` without
+acquiring a new tool schema: replace `action` with `operation` in the request, then
+compile on WSL and submit the resulting expression as `data.code`:
+
+```bash
+python -m autocad_mcp.revision compile request.json \
+  --lisp-path C:/path/to/autocad-mcp/lisp-code/revision_tools.lsp --output batch.lsp
+```
+
+Keep the Python compiler and Windows LISP helper at the same repository revision.
+Native revision `save` defaults to AutoCAD 2010 (`format:48`) and honors the format
+even when `path` is omitted. It saves the verified active copy in that case;
+an explicit new destination must not exist. Verify `AC1024` in the saved DWG header.
+The ordinary `drawing.save`/QSAVE tool follows the application's save defaults.
+
+Guarded revision patches can set an entity's linetype (DXF 6) and linetype scale
+(DXF 48), for example electrical signal lines in a P&ID. The linetype must already
+be loaded, or be ByLayer/ByBlock; the scale must be finite and positive. Old-value
+checks apply to both fields. Inspect the native pattern at the intended plot scale.
+
+For repeated instrument labels, an `attributes` operation updates up to 16 attributes
+on one existing block. Supply the changed `attributes` and their `expected_attributes`;
+native preflight checks unique tags, old values and unlocked layers before the batch
+starts. This groups function/loop/alarm changes while retaining the seven-operation
+batch limit, before/after receipts and screenshot review. It does not infer loop identities.
+
+Use the guarded `rotate` revision operation to turn an existing planar block and its
+attributes together about its insertion point. `target` is an absolute angle in radians;
+include the expected insertion point (DXF 10), rotation (50) and normal (210), in addition
+to type, owner and layer. This supports upright instrument lettering without recreating
+each attribute. Recheck process/signal attachments: arbitrary equipment rotation can move
+its ports. Old-value failures now identify the handle, DXF field and conflicting values.
+
+Inspect native readback and a screenshot after every batch; save checkpoints between
+sheets. Journals are evidence, not automatic rollback. Serialize desktop clients and
+human edits. On timeout, reconcile the pending receipt and actual drawing before any
+retry; newer clients hold dispatch until explicit acknowledgement. Older running
+clients need reconnecting to acquire the process lease and new operation schema.
+
+### Consistent symbols, crossing gaps and layers
+
+`autocad_mcp.symbol_normalization.scale_with_connections(symbol, entities, target,
+ports, item=..., anchor=...)` plans a bounded resize from qualified block-local XY
+ports. It preserves rotation and mirror signs, matches LINE/open straight-polyline
+endpoints, and refuses a resize that would turn an orthogonal connection diagonal.
+The optional local anchor keeps that point fixed and retains attribute lettering
+through a transform patch. Review unmatched ports, junctions and lettering yourself;
+the planner does not infer equipment families or reroute a network. Its return value
+contains `operations` and the before/after port matches. Supply fresh native entities.
+
+For CTO symbols, inspect the installed DWG definition's units, base point and real
+process ports before choosing target scale. Equal insertion factors across unrelated
+definitions are not equal visible sizes. Keep proprietary CTO artwork outside this
+repository. Normalize legend samples with the adopted symbol families.
+
+`spline-gap` removes a short, explicitly selected interior interval of an open SPLINE.
+Supply its full `expected_dxf` and two ordered 3D `gap` points on the curve. The helper
+uses `command-s` inside the guarded call and verifies both resulting spline endpoints.
+Use this for an embedded crossing jumper only after identifying the true crossing;
+retain hose curvature elsewhere. A non-erase batch operation returning no handles now
+fails with `MUTATION_RETURNED_NO_HANDLES` rather than claiming an empty success.
+
+`rename_layers` accepts `drawing`, a new `journal` path, and 1–7 `pairs` of old/new
+names. It preflights all names, preserves layer objects, compares all recorded layer
+properties except name/ename, and records each rename. It does not merge layers or
+change entity overrides. Update cached entity layers before planning another edit.
+Layer `0` and `Defpoints` are reserved. Example compiler request:
+
+```json
+{"operation":"rename_layers","drawing":"C:/work/copy.dwg",
+ "journal":"C:/work/layers-01.json","pairs":[["Process","P-PIPE-MAIN"]]}
+```
+
+These operations were used in a native AutoCAD LT 2027 P&ID revision with bounded
+readback and viewport review; no automated test suite was run for this change.
+Refresh the actual view after a zoom before capturing it: `ZoomCenter` using the
+current `VIEWCTR`/`VIEWSIZE` resolved stale screenshot frames where Regen alone did
+not. Cloud replacement must account for the boundary, triangle and revision text
+handles returned by its receipt.
+
+The reusable `expected_state` helper preserves the first DXF value when codes repeat.
+`cloud_covers_bounds` checks an entire target rectangle against a cloud polygon,
+including its concave cutouts; bounding-box overlap alone is insufficient.
+
+For layer cleanup or matching new piping to an existing run, a guarded `patch` can
+set colour (DXF 62), layer (8), and lineweight (370). Include their actual old values
+in `expect`; use `null` only when the native DXF group is absent. For example,
+`"set": {"62": 221, "370": 13}` sets colour 221 and 0.13 mm lineweight. Read the
+source run and its layer first: assigning ByLayer can change the plotted appearance.
+The adapter validates the standard lineweight values, but does not decide the
+engineering role, crossing priority, plot-style overrides or approved house weights.
 
 ## Tools
 
@@ -179,7 +311,9 @@ The File IPC backend sends keystrokes to AutoCAD's MDIClient window via `PostMes
 |----------|---------|-------------|
 | `AUTOCAD_MCP_BACKEND` | `auto` | Backend selection: `auto`, `file_ipc`, `ezdxf` |
 | `AUTOCAD_MCP_IPC_DIR` | `C:/temp` | Directory for IPC command/result JSON files (must match on both Python and LISP sides) |
-| `AUTOCAD_MCP_IPC_TIMEOUT` | `10.0` | IPC command timeout in seconds (1-300) |
+| `AUTOCAD_MCP_IPC_TIMEOUT` | `30.0` | IPC command timeout in seconds (1-300) |
+| `AUTOCAD_MCP_IPC_LONG_TIMEOUT` | `120.0` | Timeout for `execute_lisp` and plotting (up to 600) |
+| `AUTOCAD_MCP_AUTOLOAD` | `1` | Load `mcp_dispatch.lsp` into the active drawing when it does not answer (`0` to disable) |
 | `AUTOCAD_MCP_ONLY_TEXT` | `false` | Disable screenshot capture (text feedback only) |
 
 > **Note:** If you change `AUTOCAD_MCP_IPC_DIR`, you must also update the `*mcp-ipc-dir*` variable in `mcp_dispatch.lsp` to match.
@@ -198,12 +332,21 @@ AutoLISP was added to AutoCAD LT in the **2024 release (Windows only)**. AutoCAD
 | Supported (LT 2024+ Windows) | Not Supported |
 |-------------------------------|---------------|
 | `.lsp` / `.fas` / `.vlx` / `.dcl` | VLIDE (Visual LISP IDE) |
-| All `vl-*` utility functions | `vlax-*` (ActiveX/COM) |
+| Supported `vl-*` and selected `vla-*`/`vlax-*` functions | Full ActiveX/COM API parity |
 | File I/O (`open`, `read-line`, etc.) | Express Tools |
 | Entity access (`entget`, `entmod`, etc.) | 3D operations |
 | Selection sets | AutoLISP on Mac |
 
-The `mcp_dispatch.lsp` dispatcher is fully compatible with LT 2024+.
+The revision helper was exercised in Windows AutoCAD LT 2027. It uses selected
+`vla-*`/`vlax-*` functions available inside that runtime; this does not imply support
+for the complete ActiveX API or external COM automation. Qualify required operations
+on a disposable drawing for other releases.
+
+After a document switch, a stale cached command window can prevent command pickup.
+Inspect the desktop and pending receipts first. If the command was never picked up
+and no mutation occurred, `system(operation="init")` refreshes the connection; verify
+the active drawing again before resuming. Do not use reinitialization to bypass an
+uncertain completion hold.
 
 ## What's New in v3.1
 
@@ -216,7 +359,8 @@ The `mcp_dispatch.lsp` dispatcher is fully compatible with LT 2024+.
 - **Polyline/leader fix** — Point arrays properly encoded via semicolon-delimited format.
 - **ESC prefix** — Sends 2x ESC before each dispatch to cancel stale pending commands from prior timeouts.
 - **UTF-8/cp1252 fallback** — Handles non-ASCII characters in LISP result files (AutoCAD writes Windows-1252).
-- **Configurable IPC timeout** — `AUTOCAD_MCP_IPC_TIMEOUT` env var (1–300 seconds, default 10).
+- **Configurable IPC timeout** — `AUTOCAD_MCP_IPC_TIMEOUT` env var (1–300 seconds, default 30); `execute_lisp` and plotting use `AUTOCAD_MCP_IPC_LONG_TIMEOUT` (default 120).
+- **Dispatcher autoload** — `mcp_dispatch.lsp` is loaded per drawing. When a command is not picked up within 3 s (new drawing tab, dispatcher never loaded), the server loads it into the active drawing and runs that same command; a command that was picked up is never re-sent. Disable with `AUTOCAD_MCP_AUTOLOAD=0`.
 - **Thread-safe backend init** — `asyncio.Lock` prevents parallel initialization races.
 
 ## License
